@@ -51,12 +51,22 @@ service_action() {
 }
 
 show_info() {
-    local node=$1 domain port uuid path link
+    local node=$1 domain port uuid path link blue='' green='' yellow='' reset=''
+    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+        blue='\033[34m'; green='\033[32m'; yellow='\033[33m'; reset='\033[0m'
+    fi
     IFS=$'\t' read -r domain port uuid path < <(jq -er '[.domain,.port,.uuid,.path] | @tsv' "$node")
     link="vless://$uuid@$domain:$port?encryption=none&security=tls&type=ws&host=$domain&sni=$domain&path=%2F${path#/}#$domain:$port"
-    printf '\nNode Information\n\nDoH:       Disabled\nAddress:   %s:%s\nUUID:      %s\nPath:      %s\n\nQR code:\nProtocol: vless\n' "$domain" "$port" "$uuid" "$path"
-    qrencode -t UTF8 -m 2 "$link"
-    printf '\nLink:      %s\n' "$link"
+    printf '\n%b--------------------------------------------------%b\n' "$blue" "$reset"
+    printf '%bNode Information%b\n\n' "$green" "$reset"
+    printf '%bDoH:       %bDisabled%b\n' "$blue" "$yellow" "$reset"
+    printf '%bAddress:   %b%s:%s%b\n' "$blue" "$yellow" "$domain" "$port" "$reset"
+    printf '%bUUID:      %b%s%b\n' "$blue" "$yellow" "$uuid" "$reset"
+    printf '%bPath:      %b%s%b\n\n' "$blue" "$yellow" "$path" "$reset"
+    printf '%bQR code:%b\nProtocol: vless\n' "$blue" "$reset"
+    qrencode -t UTF8 -m 3 "$link"
+    printf '\n%bLink:      %b%s%b\n' "$blue" "$yellow" "$link" "$reset"
+    printf '%b--------------------------------------------------%b\n' "$blue" "$reset"
 }
 
 parse_port() {
@@ -340,11 +350,15 @@ menu_main() {
                 else printf '安装状态缺失，请重新运行安装脚本检查。\n'; menu_pause; fi ;;
             9)
                 if [[ -f $BASE/state.json ]]; then
-                    menu_run node list
-                    menu_run relay list
-                    first=$(jq -r '.nodes[0].name // .relays[0].name // ""' "$BASE/state.json")
-                    [[ -z $first ]] || menu_run info "$first"
-                    menu_run status
+                    first=$(jq -r '.nodes[0].name // ""' "$BASE/state.json")
+                    [[ -z $first ]] || menu_run node info "$first"
+                    if [[ $(jq '.relays|length' "$BASE/state.json") -gt 0 ]]; then
+                        printf '\n中转规则\n'
+                        menu_run relay list
+                    fi
+                    if [[ -z $first && $(jq '.relays|length' "$BASE/state.json") == 0 ]]; then
+                        printf '尚未配置节点或中转规则。\n'
+                    fi
                 else printf '尚未安装 dexs。\n'; fi
                 menu_pause ;;
             0) return ;;

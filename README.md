@@ -60,6 +60,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/dexs/main/install.sh)
 
 支持 1–65535，包括 443。新安装服务仍以专用用户运行，通过 `CAP_NET_BIND_SERVICE` 绑定低端口；LXC 宿主机需要保留此能力。容器需要运行中的 systemd 或 OpenRC、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
 
+`9. 查看` 按 dex 11 风格显示节点字段、二维码与导入链接；有中转规则时附上规则列表。详细服务状态使用 `dexs status` 查看。终端支持彩色显示，设置 `NO_COLOR=1` 可关闭颜色。
+
 ## TLS 证书
 
 默认通过 **Cloudflare DNS-01** 签发 Let's Encrypt 证书，不依赖公网 80/443。脚本隐藏输入 DNS 凭据，支持 API Token 和 Global API Key；建议使用仅限目标区域的 `Zone:DNS:Edit` 和 `Zone:Zone:Read` Token。该域名的权威 DNS 区域必须在对应 Cloudflare 账户中。
