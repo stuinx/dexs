@@ -1,6 +1,6 @@
-# VLESS Lite Server
+# Dex Lite — VLESS Lite Server
 
-面向 **128 MiB LXC** 的独立 VLESS 服务端安装脚本。仅运行一个 Xray 进程，直接处理 WebSocket 和 TLS；可接入 dex、v2rayN 等支持 VLESS WS TLS 的客户端。**不部署 DoH、Nginx、Caddy、Docker 或面板。**
+面向 **128 MiB LXC** 的独立 VLESS 服务端安装与命令行管理工具。多个 VLESS 节点与 TCP/UDP 中转共用一个 Xray 进程；节点直接处理 WebSocket 和 TLS，可接入 dex、v2rayN 等客户端。**不部署 DoH、Nginx、Caddy、Docker 或面板。**
 
 ## 一条命令安装
 
@@ -63,17 +63,66 @@ Protocol: vless
 Link:      vless://00000000-0000-4000-8000-000000123456@node.example.com:33344?encryption=none&security=tls&type=ws&host=node.example.com&sni=node.example.com&path=%2F123456#node.example.com:33344
 ```
 
-安装后运行 `vless-lite info` 可再次显示。终端需使用等宽字体，并有足够宽度显示完整二维码；Link 含登录凭据，请妥善保存。
+安装后运行 `dex-lite info` 可再次显示；旧命令 `vless-lite` 仍可使用。终端需使用等宽字体，并有足够宽度显示完整二维码；Link 含登录凭据，请妥善保存。
 
-## 管理和客户端配置
+## 节点管理
+
+首次安装创建名为 `main` 的节点。新增节点复用安装时的域名和证书，每个节点有独立端口、UUID 和 `/UUID末六位` 路径：
+
+```bash
+dex-lite node list
+dex-lite info
+dex-lite node add extra 33345
+dex-lite node info extra
+dex-lite node del extra
+```
+
+`node add NAME PORT [UUID]` 的 UUID 可省略并自动生成。新增成功会输出节点信息、二维码和 Link。名称支持 1–32 个字母、数字、下划线或连字符。不同节点/中转使用不同的监听端口，监听 IPv4 的所有接口；请按需要限制外部防火墙。
+
+## TCP / UDP 中转
+
+不另开 HAProxy 或第二个核心。中转采用 Xray Dokodemo-door 端口映射入站（新文档称 Tunnel），数据由 direct 出站转发：
+
+```bash
+# 本机 TCP 33346 → 最终节点 node.example.com:33344
+dex-lite relay add transit 33346 node.example.com 33344
+dex-lite relay list
+dex-lite relay info transit
+dex-lite relay del transit
+
+# 同时转发原生 TCP 和 UDP
+dex-lite relay add game 33347 target.example.com 12345 tcp,udp
+```
+
+语法：`relay add NAME LISTEN_PORT TARGET_HOST TARGET_PORT [tcp|udp|tcp,udp]`，默认 TCP。目标填写域名或 IP，不带 URL scheme、端口或 IPv6 方括号；目标端口支持 1–65535，监听端口支持 1024–65535。新增规则是未认证的固定目标端口转发，按需限制入口来源，尤其不要无意对公网提供开放 DNS 转发。
+
+转发 VLESS WS TLS 时，中转端透传 TLS，不申请证书。客户端的 **Address 改成中转机地址与入口端口；TLS/SNI、WS Host、UUID、Path 仍使用最终服务端的值**。这同样能携带封装在 VLESS WS/TCP 内的 UDP 代理数据；独立 UDP 模式则是转发原生 UDP 数据报。
+
+## 应用与恢复
+
+节点和中转的每次增删会：检查参数、端口占用和配置 → 校验真实 Xray 配置 → 重启同一个服务。**重启会短暂中断现有连接**。失败会恢复上一份配置与元数据并尝试重新启动；若恢复启动仍失败，会输出保留的恢复目录。
+
+元数据位于 `/etc/vless-lite/state.json`。管理命令使用文件锁串行处理修改；如果发现核心配置被手工修改，会拒绝覆盖，避免丢失自定义内容。节点增删不重新申请证书，不增加常驻服务。
+
+## 从初版升级
+
+已通过本项目初版安装的机器可运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh) --upgrade
+```
+
+升级管理命令、增加 `dex-lite` 别名，将旧 `node.json` 迁移为管理元数据；保留已有 UUID、端口、路径、证书、核心和运行配置，不重启服务。遇到自定义配置会拒绝自动迁移。该命令适用于本项目已有安装，不会接管 dex 或其他脚本创建的服务。
+
+## 服务和客户端配置
 
 ```bash
 systemctl status vless-lite
 journalctl -u vless-lite -n 30 --no-pager
-vless-lite info
+dex-lite info
 ```
 
-配置位于 `/etc/vless-lite/config.json`，服务使用专用用户 `vless-lite`。安装程序拒绝覆盖已有安装，也不替换 dex 的现有服务；如端口已被占用，会中止安装。
+配置位于 `/etc/vless-lite/config.json`，服务使用专用用户 `vless-lite`。新安装程序拒绝覆盖已有安装；已有安装使用 `--upgrade` 更新管理工具。
 
 在 dex 添加普通节点：Address 填 `域名:端口`，TLS/SNI 填域名，UUID 和 Path 按输出填写，协议为 VLESS。不要将 `DoH: Disabled` 填入客户端的 DoH 设置。
 
@@ -83,4 +132,4 @@ vless-lite info
 
 现有 128 MiB LXC 上的同类单进程方案已测得约 11 MiB 空闲占用，并通过 dex Xray 26.3.27 客户端的 HTTPS 代理请求。此数字不是所有安装的内存保证。
 
-本仓库的验证记录见 `VALIDATION.md`。完整安装涉及包安装、证书签发和 systemd；不能把配置测试等同于所有系统和架构的完整安装验收。
+本仓库的验证记录见 `VALIDATION.md`。完整安装涉及包安装、证书签发和 systemd；不能把配置测试等同于所有系统和架构的完整安装验收。额外节点及中转会增加连接缓冲和内存，单进程不代表零额外开销。

@@ -1,28 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
+test_xray=${XRAY_BIN:?Set XRAY_BIN to the Linux Xray binary}
 # shellcheck disable=SC1091
 source "$(dirname "$0")/../install.sh"
-: "${XRAY_BIN:?Set XRAY_BIN to the Linux Xray binary}"
-taskdir=$(mktemp -d /tmp/vless-lite-smoke.XXXXXX)
-server_pid=''
+XRAY_BIN=$test_xray
+taskdir=$(mktemp -d /tmp/dex-lite-smoke.XXXXXX)
+BASE="$taskdir/base"
+server_home=$BASE
+export CONFIG_GROUP=root
 client_pid=''
+echo_pid=''
 cleanup() {
-    [[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null || true
+    [[ ! -f $server_home/pid ]] || kill "$(cat "$server_home/pid")" 2>/dev/null || true
     [[ -z $client_pid ]] || kill "$client_pid" 2>/dev/null || true
+    [[ -z $echo_pid ]] || kill "$echo_pid" 2>/dev/null || true
     wait 2>/dev/null || true
     rm -rf "$taskdir"
 }
 trap cleanup EXIT
-[[ -z $(ss -H -ltn 'sport = :29344') && -z $(ss -H -ltn 'sport = :29345') ]]
-uuid=00000000-0000-4000-8000-000000123456
+for port in 29344 29345 29346 29347 29348 29349 29350; do
+    [[ -z $(ss -H -ltn "sport = :$port") && -z $(ss -H -lun "sport = :$port") ]]
+done
+mkdir -p "$BASE/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -subj /CN=node.example.com -addext subjectAltName=DNS:node.example.com \
-    -keyout "$taskdir/key.pem" -out "$taskdir/cert.pem" -days 1 >/dev/null 2>&1
-write_config "$uuid" 29344 "$taskdir/cert.pem" "$taskdir/key.pem" > "$taskdir/server.json"
-jq -e '.inbounds[0].streamSettings.wsSettings.path == "/123456" and .inbounds[0].streamSettings.security == "tls"' "$taskdir/server.json" >/dev/null
-"$XRAY_BIN" run -test -config "$taskdir/server.json" > "$taskdir/check.log" 2>&1
-jq -n --arg uuid "$uuid" '{domain:"node.example.com",port:29344,uuid:$uuid,path:"/123456"}' > "$taskdir/node.json"
-show_info "$taskdir/node.json" > "$taskdir/info.txt"
+    -keyout "$BASE/tls/key.pem" -out "$BASE/tls/fullchain.pem" -days 1 >/dev/null 2>&1
+cat > "$BASE/state.json" <<'JSON'
+{"version":1,"domain":"node.example.com","nodes":[{"name":"main","port":29344,"uuid":"00000000-0000-4000-8000-000000123456"}],"relays":[]}
+JSON
+validate_state "$BASE/state.json"
+render_state "$BASE/state.json" > "$BASE/config.json"
+jq -e '.inbounds[0].streamSettings.wsSettings.path == "/123456" and .inbounds[0].streamSettings.security == "tls"' "$BASE/config.json" >/dev/null
+"$XRAY_BIN" run -test -config "$BASE/config.json" > "$taskdir/check.log" 2>&1
+node_info main > "$taskdir/info.txt"
 grep -q '^DoH:       Disabled$' "$taskdir/info.txt"
 grep -q '^Path:      /123456$' "$taskdir/info.txt"
 grep -q 'security=tls&type=ws&host=node.example.com&sni=node.example.com&path=%2F123456' "$taskdir/info.txt"
@@ -35,14 +45,40 @@ scrub_dns
 if grep -q '^SAVED_CF_' "$ACME_HOME/account.conf"; then exit 1; fi
 grep -q '^OTHER_SETTING=' "$ACME_HOME/account.conf"
 echo 'One-time DNS credential cleanup: passed'
-"$XRAY_BIN" run -config "$taskdir/server.json" > "$taskdir/server.log" 2>&1 &
-server_pid=$!
+
+# Only the service controller is replaced; every restart uses the real Xray binary.
+systemctl() {
+    case "$1" in
+        restart)
+            if [[ -f $BASE/pid ]]; then
+                kill "$(cat "$BASE/pid")" 2>/dev/null || true
+                sleep 0.2
+            fi
+            if [[ -f $BASE/fail-next-restart ]]; then rm "$BASE/fail-next-restart"; return 1; fi
+            "$XRAY_BIN" run -config "$BASE/config.json" > "$taskdir/server.log" 2>&1 9>&- &
+            printf '%s\n' "$!" > "$BASE/pid"
+            ;;
+        is-active) kill -0 "$(cat "$BASE/pid")" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+systemctl restart vless-lite.service
+(manager_main node add extra 29346 00000000-0000-4000-8000-000000654321) > "$taskdir/add.txt"
+(manager_main relay add transit 29347 127.0.0.1 29344 tcp)
+(manager_main relay add udp-test 29348 127.0.0.1 29349 tcp,udp)
+(manager_main node list) | grep -q extra
+(manager_main relay list) | grep -q transit
+(manager_main node info extra) > "$taskdir/extra-info.txt"
+grep -q '/654321' "$taskdir/extra-info.txt"
+(manager_main relay info transit) | jq -e '.port == 29347 and .target_port == 29344' >/dev/null
+[[ $(jq '.inbounds | length' "$BASE/config.json") == 4 ]]
+echo 'Node and relay add/list/info, shared core configuration: passed'
+
 cat > "$taskdir/client.json" <<'JSON'
-{"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":29345,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":29344,"users":[{"id":"00000000-0000-4000-8000-000000123456","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"node.example.com"},"wsSettings":{"path":"/123456"}}}]}
+{"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":29345,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":29347,"users":[{"id":"00000000-0000-4000-8000-000000123456","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"node.example.com"},"wsSettings":{"path":"/123456"}}}]}
 JSON
-jq --arg cert "$taskdir/cert.pem" '.outbounds[0].streamSettings.tlsSettings.certificates=[{usage:"verify",certificateFile:$cert}]' "$taskdir/client.json" > "$taskdir/client-trusted.json"
-mv "$taskdir/client-trusted.json" "$taskdir/client.json"
-"$XRAY_BIN" run -config "$taskdir/client.json" > "$taskdir/client.log" 2>&1 &
+jq --arg cert "$BASE/tls/fullchain.pem" '.outbounds[0].streamSettings.tlsSettings.certificates=[{usage:"verify",certificateFile:$cert}]' "$taskdir/client.json" > "$taskdir/client-trusted.json"
+"$XRAY_BIN" run -config "$taskdir/client-trusted.json" > "$taskdir/client.log" 2>&1 &
 client_pid=$!
 sleep 1
 if ! status=$(curl -sS --proxy socks5h://127.0.0.1:29345 --noproxy '' --connect-timeout 8 --max-time 25 -o /dev/null -w '%{http_code}' https://example.com/); then
@@ -50,4 +86,62 @@ if ! status=$(curl -sS --proxy socks5h://127.0.0.1:29345 --noproxy '' --connect-
     exit 1
 fi
 [[ $status == 200 ]]
-printf 'Generated server config + VLESS WS TLS HTTPS traffic: HTTP %s\n' "$status"
+printf 'TCP relay -> VLESS WS TLS node -> HTTPS: HTTP %s\n' "$status"
+python3 -u - <<'PY' &
+import socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(('127.0.0.1', 29349))
+while True:
+    data, peer = sock.recvfrom(2048)
+    sock.sendto(data, peer)
+PY
+echo_pid=$!
+sleep 0.2
+python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    sock.settimeout(5)
+    sock.sendto(b'dex-lite-udp-test', ('127.0.0.1', 29348))
+    assert sock.recv(2048) == b'dex-lite-udp-test'
+print('Native UDP relay echo: passed')
+PY
+
+before=$(sha256sum "$BASE/config.json" "$BASE/state.json")
+if (manager_main relay add invalid 29350 'bad/target' 443) >/dev/null 2>&1; then exit 1; fi
+if (manager_main node add duplicate 29344) >/dev/null 2>&1; then exit 1; fi
+[[ $(sha256sum "$BASE/config.json" "$BASE/state.json") == "$before" ]]
+touch "$BASE/fail-next-restart"
+if (manager_main relay add rollback 29350 127.0.0.1 29344) > "$taskdir/rollback.txt" 2>&1; then exit 1; fi
+[[ $(sha256sum "$BASE/config.json" "$BASE/state.json") == "$before" ]]
+systemctl is-active --quiet vless-lite.service
+grep -q 'previous configuration restored' "$taskdir/rollback.txt"
+echo 'Invalid input rejection and failed-restart rollback: passed'
+(manager_main node del extra)
+(manager_main relay del transit)
+(manager_main relay del udp-test)
+[[ $(jq '.nodes|length' "$BASE/state.json") == 1 && $(jq '.relays|length' "$BASE/state.json") == 0 ]]
+[[ $(jq -r '.nodes[0].uuid' "$BASE/state.json") == 00000000-0000-4000-8000-000000123456 ]]
+echo 'Node/relay deletion with original main identity preserved: passed'
+cp "$BASE/config.json" "$taskdir/config.saved.json"
+jq '.log.loglevel="error"' "$BASE/config.json" > "$taskdir/edited.json"
+cp "$taskdir/edited.json" "$BASE/config.json"
+if (manager_main relay add drift 29350 127.0.0.1 29344) > "$taskdir/drift.txt" 2>&1; then exit 1; fi
+cmp -s "$taskdir/edited.json" "$BASE/config.json"
+grep -q 'edited outside dex-lite' "$taskdir/drift.txt"
+cp "$taskdir/config.saved.json" "$BASE/config.json"
+echo 'External configuration edit protection: passed'
+
+BASE="$taskdir/legacy"
+MANAGER_DIR="$taskdir/bin"
+mkdir -p "$BASE" "$MANAGER_DIR"
+jq '.domain as $domain | .nodes[0] | {domain:$domain,port,uuid,path:("/"+.uuid[-6:])}' "$server_home/state.json" > "$BASE/node.json"
+jq '{version:1,domain,nodes:[{name:"main",port,uuid}],relays:[]}' "$BASE/node.json" > "$taskdir/legacy-state.json"
+render_state "$taskdir/legacy-state.json" | jq 'del(.inbounds[].tag,.outbounds[].tag)' > "$BASE/config.json"
+before=$(sha256sum "$BASE/config.json")
+(upgrade_manager)
+validate_state "$BASE/state.json"
+[[ $(jq -r '.nodes[0].uuid' "$BASE/state.json") == 00000000-0000-4000-8000-000000123456 ]]
+[[ $(sha256sum "$BASE/config.json") == "$before" ]]
+bash "$MANAGER_DIR/dex-lite" help > "$taskdir/manager-help.txt"
+grep -q 'relay add' "$taskdir/manager-help.txt"
+echo 'Legacy metadata migration and generated management command: passed'
