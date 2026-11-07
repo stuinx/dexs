@@ -2,6 +2,8 @@
 
 面向 **128 MiB LXC** 的独立 VLESS 服务端安装与命令行管理工具。多个 VLESS 节点与 TCP/UDP 中转共用一个 Xray 进程；节点直接处理 WebSocket 和 TLS，可接入 dex、v2rayN 等客户端。**不部署 DoH、Nginx、Caddy、Docker 或面板。**
 
+核心用途只有两项：**创建兼容 dex 的服务端节点**，以及**中转其他已有服务端节点**。可以安装为节点服务器（并按需追加中转），也可以仅安装中转。
+
 ## 一条命令安装
 
 在全新的 **Debian 12/13 amd64 或 arm64** 容器中，以 root 执行：
@@ -18,6 +20,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/mai
 bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh) \
   --domain node.example.com --port 33344
 ```
+
+默认 `--mode server` 创建 VLESS WS TLS 节点。纯中转安装使用 `--mode relay`，不需要本机域名、证书、Cloudflare 凭据或 UUID：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh) \
+  --mode relay --port 33346 --target-host node.example.com --target-port 33344
+```
+
+这表示容器的 TCP 33346 转发到已有节点 `node.example.com:33344`；可加 `--network tcp,udp`。纯中转模式跳过二维码工具和证书申请流程，完成后输出真实中转参数。运行 `dex-lite info` 查看默认中转；用 `relay add/list/info/del` 管理其他规则。尚未配置本地 TLS 节点的纯中转安装不能用 `node add` 创建节点。
 
 支持 1024–65535，避免在受限 LXC 中为低端口增加权限。容器需要 systemd、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
 

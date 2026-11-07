@@ -10,15 +10,17 @@ server_home=$BASE
 export CONFIG_GROUP=root
 client_pid=''
 echo_pid=''
+pure_pid=''
 cleanup() {
     [[ ! -f $server_home/pid ]] || kill "$(cat "$server_home/pid")" 2>/dev/null || true
     [[ -z $client_pid ]] || kill "$client_pid" 2>/dev/null || true
     [[ -z $echo_pid ]] || kill "$echo_pid" 2>/dev/null || true
+    [[ -z $pure_pid ]] || kill "$pure_pid" 2>/dev/null || true
     wait 2>/dev/null || true
     rm -rf "$taskdir"
 }
 trap cleanup EXIT
-for port in 29344 29345 29346 29347 29348 29349 29350; do
+for port in 29344 29345 29346 29347 29348 29349 29350 29351; do
     [[ -z $(ss -H -ltn "sport = :$port") && -z $(ss -H -lun "sport = :$port") ]]
 done
 mkdir -p "$BASE/tls"
@@ -87,6 +89,32 @@ if ! status=$(curl -sS --proxy socks5h://127.0.0.1:29345 --noproxy '' --connect-
 fi
 [[ $status == 200 ]]
 printf 'TCP relay -> VLESS WS TLS node -> HTTPS: HTTP %s\n' "$status"
+pure_base="$taskdir/pure-relay"
+mkdir "$pure_base"
+cat > "$pure_base/state.json" <<'JSON'
+{"version":1,"domain":"","nodes":[],"relays":[{"name":"main","port":29350,"host":"127.0.0.1","target_port":29344,"network":"tcp"}]}
+JSON
+validate_state "$pure_base/state.json"
+(BASE="$pure_base"; render_state "$BASE/state.json") > "$pure_base/config.json"
+jq -e '.inbounds|all(.protocol=="dokodemo-door" and .streamSettings==null)' "$pure_base/config.json" >/dev/null
+(BASE="$pure_base"; manager_main info) > "$taskdir/pure-info.json"
+jq -e '.target_port==29344' "$taskdir/pure-info.json" >/dev/null
+if (BASE="$pure_base"; manager_main node add blocked 29351) >/dev/null 2>&1; then exit 1; fi
+"$XRAY_BIN" run -config "$pure_base/config.json" > "$taskdir/pure.log" 2>&1 &
+pure_pid=$!
+kill "$client_pid"
+wait "$client_pid" 2>/dev/null || true
+jq '.outbounds[0].settings.vnext[0].port=29350' "$taskdir/client-trusted.json" > "$taskdir/pure-client.json"
+"$XRAY_BIN" run -config "$taskdir/pure-client.json" > "$taskdir/pure-client.log" 2>&1 &
+client_pid=$!
+sleep 1
+status=$(curl -sS --proxy socks5h://127.0.0.1:29345 --noproxy '' --connect-timeout 8 --max-time 25 -o /dev/null -w '%{http_code}' https://example.com/)
+[[ $status == 200 && ! -e $pure_base/tls ]]
+printf 'Relay-only configuration without domain/certificate -> external node: HTTP %s\n' "$status"
+kill "$pure_pid"
+wait "$pure_pid" 2>/dev/null || true
+pure_pid=''
+BASE=$server_home
 python3 -u - <<'PY' &
 import socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

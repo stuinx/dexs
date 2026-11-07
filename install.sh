@@ -61,7 +61,10 @@ validate_state() {
       ([.nodes[].name] | length == (unique | length)) and
       ([.relays[].name] | length == (unique | length))
     ' "$state" >/dev/null || return 1
-    valid_host "$(jq -r .domain "$state")" || return 1
+    host=$(jq -r .domain "$state")
+    if [[ -n $host ]]; then valid_host "$host" || return 1; else
+        [[ $(jq '.nodes|length' "$state") == 0 ]] || return 1
+    fi
     while IFS= read -r host; do valid_host "$host" || return 1; done < <(jq -r '.relays[].host' "$state")
 }
 
@@ -129,12 +132,16 @@ node_info() {
     show_info <(jq --arg name "$name" '.domain as $domain | .nodes[] | select(.name==$name) | {domain:$domain,port,uuid,path:("/"+.uuid[-6:])}' "$BASE/state.json")
 }
 
+relay_info() {
+    jq -e --arg name "$1" '.relays[] | select(.name==$name)' "$BASE/state.json" || die "Unknown relay: $1"
+}
+
 manager_main() {
     [[ $EUID == 0 ]] || die 'Run as root.'
     if [[ ${1:-help} == help || ${1:-} == --help ]]; then
         cat <<'HELP'
 Dex Lite — one Xray process for VLESS WS TLS nodes and port relays
-  dex-lite info [NAME]                       Node information + QR (default main)
+  dex-lite info [NAME]                       Node + QR or relay details (default main)
   dex-lite node list
   dex-lite node add NAME PORT [UUID]         Reuse installed hostname/certificate
   dex-lite node info NAME
@@ -155,7 +162,12 @@ HELP
     local action=${1:-info} kind command name port uuid host target network next
     case "$action" in
         status) systemctl --no-pager status vless-lite.service; return ;;
-        info) node_info "${2:-main}"; return ;;
+        info)
+            name=${2:-main}
+            if jq -e --arg name "$name" '.nodes[] | select(.name==$name)' "$BASE/state.json" >/dev/null; then
+                node_info "$name"
+            else relay_info "$name"; fi
+            return ;;
         node|relay) kind=$action; command=${2:-list} ;;
         *) die 'Unknown command; use dex-lite help.' ;;
     esac
@@ -172,7 +184,7 @@ HELP
         info)
             (($# == 3)) || die "Usage: dex-lite $kind info NAME"
             if [[ $kind == node ]]; then node_info "$3"; else
-                jq -e --arg name "$3" '.relays[] | select(.name==$name)' "$BASE/state.json" || die "Unknown relay: $3"
+                relay_info "$3"
             fi
             return ;;
         add|del) (($# >= 3)) || die 'A name is required.'; name=$3 ;;
@@ -181,6 +193,7 @@ HELP
     valid_name "$name" || die 'Name: 1-32 letters, digits, underscore or hyphen.'
     if [[ $command == add ]]; then
         if [[ $kind == node ]]; then
+            [[ -n $(jq -r .domain "$BASE/state.json") && -r $BASE/tls/fullchain.pem && -r $BASE/tls/key.pem ]] || die 'This relay-only installation has no TLS setup; node creation is unavailable.'
             (($# == 4 || $# == 5)) || die 'Usage: dex-lite node add NAME PORT [UUID]'
             port=$(parse_port "$4")
             uuid=${5:-$(cat /proc/sys/kernel/random/uuid)}
@@ -234,7 +247,7 @@ BASE=/etc/vless-lite
 XRAY_BIN=/usr/local/bin/vless-lite-xray
 CONFIG_GROUP=vless-lite
 MANAGER
-        declare -f die show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info manager_main
+        declare -f die show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info relay_info manager_main
         # shellcheck disable=SC2016
         printf '\nmanager_main "$@"\n'
     } > "$temporary"
@@ -292,21 +305,25 @@ main() {
         --upgrade) (($# == 1)) || die '--upgrade does not accept installation options.'; upgrade_manager; return ;;
     esac
     local domain='' port=2096 uuid='' cert='' key='' renew=0 version='' work=''
+    local mode=server target_host='' target_port='' network=tcp
     local arch asset expected expiry method email hook label
     local -a labels
     while (($#)); do
         case "$1" in
-            --domain|--port|--uuid|--cert-file|--key-file|--version)
+            --domain|--port|--uuid|--cert-file|--key-file|--version|--mode|--target-host|--target-port|--network)
                 (($# >= 2)) || die "$1 requires a value"
                 case "$1" in
                     --domain) domain=$2 ;; --port) port=$2 ;; --uuid) uuid=$2 ;;
                     --cert-file) cert=$2 ;; --key-file) key=$2 ;; --version) version=$2 ;;
+                    --mode) mode=$2 ;; --target-host) target_host=$2 ;; --target-port) target_port=$2 ;;
+                    --network) network=$2 ;;
                 esac
                 shift 2 ;;
             --renew) renew=1; shift ;;
             -h|--help)
                 cat <<'HELP'
 Usage: bash install.sh [options]
+  --mode server|relay Create a dex-compatible node or a plain relay (default server)
   --domain HOST       TLS hostname; prompted when omitted
   --port PORT         Container listening port, 1024-65535 (default 2096)
   --uuid UUID         Existing UUID; generated when omitted
@@ -314,10 +331,13 @@ Usage: bash install.sh [options]
   --key-file FILE     Matching unencrypted PEM private key
   --version TAG       Official Xray release tag (default latest stable)
   --renew             Keep DNS credentials and enable certificate renewal
+  --target-host HOST  Relay mode: destination hostname/IP (no scheme or port)
+  --target-port PORT  Relay mode: destination port, 1-65535
+  --network NETWORK   Relay mode: tcp, udp, or tcp,udp (default tcp)
   --upgrade           Upgrade installed command and migrate legacy metadata
-  info                Show installed main node information and QR code
+  info                Show main node + QR, or main relay details
 
-Without certificate files, uses Cloudflare DNS validation. Credentials are
+Server mode without certificate files uses Cloudflare DNS validation. Credentials are
 read from CF_Token or CF_Key/CF_Email, or prompted without echoing the secret.
 By default DNS credentials are removed after issuance; renewal is manual.
 HELP
@@ -331,30 +351,42 @@ HELP
     [[ -d /run/systemd/system ]] || die 'Requires systemd inside the container.'
     . /etc/os-release
     [[ $ID == debian && ( $VERSION_ID == 12 || $VERSION_ID == 13 ) ]] || die 'Supported systems: Debian 12/13.'
-    if [[ -z $domain ]]; then read -r -p 'Domain: ' domain </dev/tty; fi
-    domain=${domain,,}
-    [[ ${#domain} -le 253 && $domain == *.* && $domain != *..* && $domain =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die 'Invalid hostname; enter the hostname without scheme, port or path.'
-    IFS=. read -r -a labels <<< "$domain"
-    for label in "${labels[@]}"; do
-        [[ ${#label} -le 63 && $label =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die 'Invalid hostname label.'
-    done
-    [[ $port =~ ^[0-9]{1,5}$ ]] || die 'Invalid port.'
-    port=$((10#$port))
-    ((port >= 1024 && port <= 65535)) || die 'Port must be 1024-65535.'
-    [[ -n $uuid ]] || uuid=$(cat /proc/sys/kernel/random/uuid)
-    uuid=${uuid,,}
-    [[ $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die 'Invalid UUID.'
-    [[ -z $cert && -z $key || -n $cert && -n $key ]] || die 'Provide both --cert-file and --key-file.'
-    [[ -z $cert || $renew == 0 ]] || die '--renew is only available for certificates issued by this installer.'
+    [[ $mode == server || $mode == relay ]] || die 'Mode must be server or relay.'
+    port=$(parse_port "$port")
+    if [[ $mode == server ]]; then
+        [[ -z $target_host && -z $target_port && $network == tcp ]] || die 'Target/network options are for relay mode.'
+        if [[ -z $domain ]]; then read -r -p 'Domain: ' domain </dev/tty; fi
+        domain=${domain,,}
+        [[ ${#domain} -le 253 && $domain == *.* && $domain != *..* && $domain =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die 'Invalid hostname; enter the hostname without scheme, port or path.'
+        IFS=. read -r -a labels <<< "$domain"
+        for label in "${labels[@]}"; do
+            [[ ${#label} -le 63 && $label =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die 'Invalid hostname label.'
+        done
+        [[ -n $uuid ]] || uuid=$(cat /proc/sys/kernel/random/uuid)
+        uuid=${uuid,,}
+        [[ $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die 'Invalid UUID.'
+        [[ -z $cert && -z $key || -n $cert && -n $key ]] || die 'Provide both --cert-file and --key-file.'
+        [[ -z $cert || $renew == 0 ]] || die '--renew is only available for certificates issued by this installer.'
+    else
+        [[ -z $domain && -z $uuid && -z $cert && -z $key && $renew == 0 ]] || die 'Relay mode does not use a domain, UUID, certificate or renewal.'
+        if [[ -z $target_host ]]; then read -r -p 'Target hostname/IP: ' target_host </dev/tty; fi
+        if [[ -z $target_port ]]; then read -r -p 'Target port: ' target_port </dev/tty; fi
+        valid_host "$target_host" || die 'Invalid target hostname/IP.'
+        target_port=$(parse_port "$target_port" 1)
+        [[ $network == tcp || $network == udp || $network == tcp,udp ]] || die 'Network must be tcp, udp or tcp,udp.'
+        [[ $port != "$target_port" || ( $target_host != 127.0.0.1 && $target_host != ::1 && $target_host != localhost ) ]] || die 'Relay cannot point to its own listening port.'
+    fi
     case $(uname -m) in x86_64) arch=64 ;; aarch64|arm64) arch=arm64-v8a ;; *) die 'Supported CPU architectures: amd64/arm64.' ;; esac
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends ca-certificates curl jq unzip openssl qrencode iproute2 util-linux
-    [[ -z $(ss -H -ltn "sport = :$port") ]] || die "TCP port $port is already in use."
+    apt-get install -y --no-install-recommends ca-certificates curl jq unzip iproute2 util-linux
+    if [[ $mode == server ]]; then apt-get install -y --no-install-recommends openssl qrencode; fi
+    port_available "$port" "$network" || die "Listening port $port is already in use."
     work=$(mktemp -d /tmp/vless-lite.XXXXXX)
     cleanup_work=$work
     keep_dns=$renew
-    trap '[[ $keep_dns == 1 ]] || scrub_dns; rm -rf "$cleanup_work"' EXIT
+    dns_used=0
+    trap 'if [[ $dns_used == 1 && $keep_dns != 1 ]]; then scrub_dns; fi; rm -rf "$cleanup_work"' EXIT
     if [[ -z $version ]]; then
         version=$(curl --connect-timeout 10 --max-time 60 -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -er .tag_name)
     fi
@@ -368,51 +400,57 @@ HELP
     unzip -q "$work/$asset" xray -d "$work"
     getent group vless-lite >/dev/null || groupadd --system vless-lite
     id vless-lite >/dev/null 2>&1 || useradd --system --gid vless-lite --home-dir /nonexistent --shell /usr/sbin/nologin vless-lite
-    install -d -o root -g vless-lite -m 0750 "$BASE" "$BASE/tls"
+    install -d -o root -g vless-lite -m 0750 "$BASE"
     install -m 0755 "$work/xray" /usr/local/bin/vless-lite-xray
-    if [[ -n $cert ]]; then
-        [[ -r $cert && -r $key ]] || die 'Certificate/key not readable.'
-        install -o root -g vless-lite -m 0640 "$cert" "$BASE/tls/fullchain.pem"
-        install -o root -g vless-lite -m 0640 "$key" "$BASE/tls/key.pem"
+    if [[ $mode == server ]]; then
+        install -d -o root -g vless-lite -m 0750 "$BASE/tls"
+        if [[ -n $cert ]]; then
+            [[ -r $cert && -r $key ]] || die 'Certificate/key not readable.'
+            install -o root -g vless-lite -m 0640 "$cert" "$BASE/tls/fullchain.pem"
+            install -o root -g vless-lite -m 0640 "$key" "$BASE/tls/key.pem"
+        else
+            dns_used=1
+            if [[ -z ${CF_Token:-} && -z ${CF_Key:-} ]]; then
+                read -r -p 'Cloudflare credential type [token/key] (token): ' method </dev/tty
+                case ${method:-token} in
+                    token) read -r -s -p 'Cloudflare API Token: ' CF_Token </dev/tty; export CF_Token ;;
+                    key) read -r -s -p 'Cloudflare Global API Key: ' CF_Key </dev/tty; export CF_Key ;;
+                    *) die 'Choose token or key.' ;;
+                esac
+                printf '\n'
+            fi
+            if [[ -n ${CF_Key:-} && -z ${CF_Email:-} ]]; then
+                read -r -p 'Cloudflare account email: ' CF_Email </dev/tty
+                export CF_Email
+            fi
+            read -r -p 'ACME account email: ' email </dev/tty
+            [[ $email == *@*.* ]] || die 'Email is required.'
+            install -d -m 0700 "$ACME_HOME/dnsapi"
+            curl --connect-timeout 10 --max-time 60 -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$ACME_HOME/acme.sh"
+            curl --connect-timeout 10 --max-time 60 -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi/dns_cf.sh -o "$ACME_HOME/dnsapi/dns_cf.sh"
+            chmod 0700 "$ACME_HOME/acme.sh"
+            "$ACME_HOME/acme.sh" --home "$ACME_HOME" --register-account --server letsencrypt -m "$email"
+            "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue --server letsencrypt --dns dns_cf -d "$domain" --keylength ec-256
+            hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if systemctl cat vless-lite.service >/dev/null 2>&1; then systemctl try-restart vless-lite.service; fi"
+            "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" --ecc --fullchain-file "$BASE/tls/fullchain.pem" --key-file "$BASE/tls/key.pem" --reloadcmd "$hook"
+            if ((renew == 0)); then scrub_dns; fi
+        fi
+        openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkend 0 || die 'Expired certificate.'
+        openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkhost "$domain" | grep -Fq 'does match certificate' || die 'Certificate hostname mismatch.'
+        [[ $(openssl x509 -in "$BASE/tls/fullchain.pem" -pubkey -noout | openssl sha256) == $(openssl pkey -in "$BASE/tls/key.pem" -pubout -passin pass: | openssl sha256) ]] || die 'Certificate/private key mismatch.'
+        chown root:vless-lite "$BASE/tls/"*.pem
+        chmod 0640 "$BASE/tls/"*.pem
+        jq -n --arg domain "$domain" --argjson port "$port" --arg uuid "$uuid" '{version:1,domain:$domain,nodes:[{name:"main",port:$port,uuid:$uuid}],relays:[]}' > "$BASE/state.json"
     else
-        if [[ -z ${CF_Token:-} && -z ${CF_Key:-} ]]; then
-            read -r -p 'Cloudflare credential type [token/key] (token): ' method </dev/tty
-            case ${method:-token} in
-                token) read -r -s -p 'Cloudflare API Token: ' CF_Token </dev/tty; export CF_Token ;;
-                key) read -r -s -p 'Cloudflare Global API Key: ' CF_Key </dev/tty; export CF_Key ;;
-                *) die 'Choose token or key.' ;;
-            esac
-            printf '\n'
-        fi
-        if [[ -n ${CF_Key:-} && -z ${CF_Email:-} ]]; then
-            read -r -p 'Cloudflare account email: ' CF_Email </dev/tty
-            export CF_Email
-        fi
-        read -r -p 'ACME account email: ' email </dev/tty
-        [[ $email == *@*.* ]] || die 'Email is required.'
-        install -d -m 0700 "$ACME_HOME/dnsapi"
-        curl --connect-timeout 10 --max-time 60 -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$ACME_HOME/acme.sh"
-        curl --connect-timeout 10 --max-time 60 -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi/dns_cf.sh -o "$ACME_HOME/dnsapi/dns_cf.sh"
-        chmod 0700 "$ACME_HOME/acme.sh"
-        "$ACME_HOME/acme.sh" --home "$ACME_HOME" --register-account --server letsencrypt -m "$email"
-        "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue --server letsencrypt --dns dns_cf -d "$domain" --keylength ec-256
-        hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if systemctl cat vless-lite.service >/dev/null 2>&1; then systemctl try-restart vless-lite.service; fi"
-        "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" --ecc --fullchain-file "$BASE/tls/fullchain.pem" --key-file "$BASE/tls/key.pem" --reloadcmd "$hook"
-        if ((renew == 0)); then scrub_dns; fi
+        jq -n --arg host "$target_host" --argjson port "$port" --argjson target "$target_port" --arg network "$network" '{version:1,domain:"",nodes:[],relays:[{name:"main",port:$port,host:$host,target_port:$target,network:$network}]}' > "$BASE/state.json"
     fi
-    openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkend 0 || die 'Expired certificate.'
-    openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkhost "$domain" | grep -Fq 'does match certificate' || die 'Certificate hostname mismatch.'
-    [[ $(openssl x509 -in "$BASE/tls/fullchain.pem" -pubkey -noout | openssl sha256) == $(openssl pkey -in "$BASE/tls/key.pem" -pubout -passin pass: | openssl sha256) ]] || die 'Certificate/private key mismatch.'
-    chown root:vless-lite "$BASE/tls/"*.pem
-    chmod 0640 "$BASE/tls/"*.pem
-    jq -n --arg domain "$domain" --argjson port "$port" --arg uuid "$uuid" '{version:1,domain:$domain,nodes:[{name:"main",port:$port,uuid:$uuid}],relays:[]}' > "$BASE/state.json"
     render_state "$BASE/state.json" > "$BASE/config.json"
     chown root:vless-lite "$BASE/config.json"
     chmod 0640 "$BASE/config.json"
     /usr/local/bin/vless-lite-xray run -test -config "$BASE/config.json"
     cat > /etc/systemd/system/vless-lite.service <<'UNIT'
 [Unit]
-Description=VLESS WebSocket TLS low-memory server
+Description=Dex Lite nodes and port relays
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -451,10 +489,16 @@ UNIT
     sleep 2
     systemctl is-active --quiet vless-lite.service || die 'Service failed; check journalctl -u vless-lite.'
     if ((renew)); then systemctl enable --now vless-lite-renew.timer; fi
-    expiry=$(openssl x509 -in "$BASE/tls/fullchain.pem" -noout -enddate)
-    printf '\nTLS %s\n' "$expiry"
-    if ((renew)); then printf 'Certificate renewal: enabled; DNS credentials retained with root-only access.\n'; else printf 'Certificate renewal: manual; DNS credentials not retained.\n'; fi
-    node_info main
+    if [[ $mode == server ]]; then
+        expiry=$(openssl x509 -in "$BASE/tls/fullchain.pem" -noout -enddate)
+        printf '\nTLS %s\n' "$expiry"
+        if ((renew)); then printf 'Certificate renewal: enabled; DNS credentials retained with root-only access.\n'; else printf 'Certificate renewal: manual; DNS credentials not retained.\n'; fi
+        node_info main
+    else
+        printf '\nRelay Information\n'
+        relay_info main
+        printf '\nClient: change Address to the relay address/port; retain final-server SNI, Host, UUID and Path.\n'
+    fi
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
