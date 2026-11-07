@@ -6,11 +6,21 @@
 
 ## 一条命令安装
 
-在全新的 **Debian 12/13 amd64 或 arm64** 容器中，以 root 执行：
+支持 **Debian 12/13 + systemd**、**Alpine 3.x + OpenRC**，CPU 为 amd64 或 arm64。在全新 Debian 容器中，以 root 执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh)
 ```
+
+Alpine 默认的 ash 不能解析 Bash 的进程替换语法，首次安装使用：
+
+```sh
+apk add --no-cache bash curl && bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh)'
+```
+
+Alpine 安装器使用 `apk`、OpenRC 和专用服务用户；节点模式使用 community 仓库的 `libqrencode-tools` 输出二维码，需要启用对应 Alpine 版本的 community 仓库。要求容器正常通过 OpenRC 启动，不支持没有初始化服务的后台运行模式。
+
+下文含 `<(...)` 的 Bash 示例，在 Alpine 的 ash 中使用前请先运行 `bash`；也可像上面一样放进 `bash -c '...'` 中。
 
 不带参数会打开 dex 风格的彩色终端菜单：
 
@@ -48,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/mai
 
 这表示容器的 TCP 33346 转发到已有节点 `node.example.com:33344`；可加 `--network tcp,udp`。纯中转模式跳过二维码工具和证书申请流程，完成后输出真实中转参数。运行 `dex-lite info` 查看默认中转；用 `relay add/list/info/del` 管理其他规则。尚未配置本地 TLS 节点的纯中转安装不能用 `node add` 创建节点。
 
-支持 1024–65535，避免在受限 LXC 中为低端口增加权限。容器需要 systemd、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
+支持 1024–65535，避免在受限 LXC 中为低端口增加权限。容器需要运行中的 systemd 或 OpenRC、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
 
 ## TLS 证书
 
@@ -61,7 +71,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/mai
   --domain node.example.com --port 33344 --renew
 ```
 
-此模式会在 `/root/.vless-lite-acme/account.conf` 中保留 DNS 凭据（仅 root 可读），通过 `vless-lite-renew.timer` 每天检查，证书更新后重启服务，现有连接会短暂断开。可通过环境变量 `CF_Token`，或 `CF_Key` 与 `CF_Email` 提供凭据；不要把密钥写进公开命令、仓库或脚本。
+此模式会在 `/root/.vless-lite-acme/account.conf` 中保留 DNS 凭据（仅 root 可读）。Debian 通过 `vless-lite-renew.timer` 每天检查，Alpine 通过 `/etc/periodic/daily/vless-lite-renew` 和 `crond` 检查。证书更新后重启正在运行的服务，现有连接会短暂断开。可通过环境变量 `CF_Token`，或 `CF_Key` 与 `CF_Email` 提供凭据；不要把密钥写进公开命令、仓库或脚本。
 
 也可使用已有证书，跳过 Cloudflare 和 ACME：
 
@@ -71,7 +81,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/mai
   --cert-file /path/to/fullchain.pem --key-file /path/to/privkey.pem
 ```
 
-证书需为 PEM 全链，私钥需为未加密 PEM。脚本会检查域名、有效期、私钥匹配，然后复制到 `/etc/vless-lite/tls/`。这种模式的续期由证书提供方负责；更换复制后的证书并设置 `root:vless-lite`、`0640` 权限后执行 `systemctl restart vless-lite`。
+证书需为 PEM 全链，私钥需为未加密 PEM。脚本会检查域名、有效期、私钥匹配，然后复制到 `/etc/vless-lite/tls/`。这种模式的续期由证书提供方负责；更换复制后的证书并设置 `root:vless-lite`、`0640` 权限后执行 `dex-lite cert-reload`。
 
 ## 安装完成后的输出
 
@@ -140,7 +150,7 @@ dex-lite relay add game 33347 target.example.com 12345 tcp,udp
 已通过本项目初版安装的机器可运行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh) --upgrade
+bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/vless-lite-server/main/install.sh) --upgrade'
 ```
 
 升级管理命令、增加 `dex-lite` 别名，将旧 `node.json` 迁移为管理元数据；保留已有 UUID、端口、路径、证书、核心和运行配置，不重启服务。遇到自定义配置会拒绝自动迁移。该命令适用于本项目已有安装，不会接管 dex 或其他脚本创建的服务。
@@ -153,14 +163,23 @@ journalctl -u vless-lite -n 30 --no-pager
 dex-lite info
 ```
 
+Alpine 使用对应的 OpenRC 命令；`dex-lite status` 会自动选择服务管理器：
+
+```sh
+rc-service vless-lite status
+rc-service vless-lite restart
+tail -n 30 /var/log/vless-lite.log
+dex-lite status
+```
+
 配置位于 `/etc/vless-lite/config.json`，服务使用专用用户 `vless-lite`。新安装程序拒绝覆盖已有安装；已有安装使用 `--upgrade` 更新管理工具。
 
 在 dex 添加普通节点：Address 填 `域名:端口`，TLS/SNI 填域名，UUID 和 Path 按输出填写，协议为 VLESS。不要将 `DoH: Disabled` 填入客户端的 DoH 设置。
 
-核心来自 XTLS/Xray-core 官方 Release，下载后核对官方 SHA256；可用 `--version v26.10.31` 固定版本。官方当前仍支持 WS，但已发出弃用提示；此项目按现有 dex 客户端兼容要求使用 WS。二维码由 Debian 的 `qrencode` 软件包生成，无常驻二维码进程。
+核心来自 XTLS/Xray-core 官方 Release，下载后核对官方 SHA256；可用 `--version v26.10.31` 固定版本。官方当前仍支持 WS，但已发出弃用提示；此项目按现有 dex 客户端兼容要求使用 WS。二维码由 `qrencode` 命令生成，无常驻二维码进程。
 
 ## 验证范围
 
 现有 128 MiB LXC 上的同类单进程方案已测得约 11 MiB 空闲占用，并通过 dex Xray 26.3.27 客户端的 HTTPS 代理请求。此数字不是所有安装的内存保证。
 
-本仓库的验证记录见 `VALIDATION.md`。完整安装涉及包安装、证书签发和 systemd；不能把配置测试等同于所有系统和架构的完整安装验收。额外节点及中转会增加连接缓冲和内存，单进程不代表零额外开销。
+本仓库的验证记录见 `VALIDATION.md`。Alpine 3.22 amd64 已在 128 MiB 测试容器中完成自备证书节点安装、纯中转安装和真实 OpenRC 管理验证；Alpine DNS 签发/续期、原生 LXC 引导及 arm64 仍待验收。额外节点及中转会增加连接缓冲和内存，单进程不代表零额外开销。

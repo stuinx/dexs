@@ -11,6 +11,45 @@ MANAGER_DIR=/usr/local/bin
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+detect_init() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+        printf 'systemd\n'
+    elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then
+        printf 'openrc\n'
+    else die '需要运行中的 systemd 或 OpenRC。'; fi
+}
+
+listeners_ready() {
+    local port network entries
+    entries=$(jq -r '.inbounds[] | [.port,(if .protocol=="dokodemo-door" then .settings.network else "tcp" end)] | @tsv' "$BASE/config.json") || return 1
+    while IFS=$'\t' read -r port network; do
+        [[ -n $port ]] || continue
+        if [[ $network == *tcp* && -z $(ss -H -ltn "sport = :$port") ]]; then return 1; fi
+        if [[ $network == *udp* && -z $(ss -H -lun "sport = :$port") ]]; then return 1; fi
+    done <<< "$entries"
+}
+
+service_action() {
+    local init
+    init=$(detect_init) || return 1
+    if [[ $init == openrc ]]; then
+        # OpenRC launches the supervisor as a child of this command.
+        unset CF_Token CF_Key CF_Email CF_Account_ID CF_Zone_ID
+    fi
+    case "$init:$1" in
+        systemd:restart) systemctl restart vless-lite.service ;;
+        systemd:active) systemctl is-active --quiet vless-lite.service && listeners_ready ;;
+        systemd:status) systemctl --no-pager status vless-lite.service ;;
+        systemd:start) systemctl daemon-reload && systemctl enable --now vless-lite.service ;;
+        # The supervisor must not inherit the configuration lock or menu terminal.
+        openrc:restart) rc-service vless-lite restart 8>&- 9>&- ;;
+        openrc:active) rc-service -q vless-lite status 8>&- 9>&- && listeners_ready ;;
+        openrc:status) rc-service vless-lite status 8>&- 9>&- ;;
+        openrc:start) rc-update add vless-lite default 8>&- 9>&- && rc-service vless-lite start 8>&- 9>&- ;;
+        *) die "Unknown service action: $1" ;;
+    esac
+}
+
 show_info() {
     local node=$1 domain port uuid path link
     IFS=$'\t' read -r domain port uuid path < <(jq -er '[.domain,.port,.uuid,.path] | @tsv' "$node")
@@ -111,13 +150,13 @@ apply_state() {
     fi
     if mv "$transaction/config.json" "$BASE/config.json" &&
         mv "$transaction/state.json" "$BASE/state.json" &&
-        systemctl restart vless-lite.service && sleep 1 && systemctl is-active --quiet vless-lite.service; then
+        service_action restart && sleep 1 && service_action active; then
         rm -rf "$transaction"
         return 0
     fi
     cp -p "$transaction/config.before.json" "$BASE/config.json"
     cp -p "$transaction/state.before.json" "$BASE/state.json"
-    if systemctl restart vless-lite.service; then
+    if service_action restart; then
         printf 'Change failed; previous configuration restored.\n' >&2
         rm -rf "$transaction"
     else
@@ -321,7 +360,11 @@ HELP
     flock -x 9
     local action=${1:-info} kind command name port uuid host target network next
     case "$action" in
-        status) systemctl --no-pager status vless-lite.service; return ;;
+        status) service_action status; return ;;
+        cert-reload)
+            "$XRAY_BIN" run -test -config "$BASE/config.json" >/dev/null
+            if service_action active; then service_action restart; fi
+            return ;;
         info)
             name=${2:-main}
             if jq -e --arg name "$name" '.nodes[] | select(.name==$name)' "$BASE/state.json" >/dev/null; then
@@ -407,7 +450,7 @@ BASE=/etc/vless-lite
 XRAY_BIN=/usr/local/bin/vless-lite-xray
 CONFIG_GROUP=vless-lite
 MANAGER
-        declare -f die show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info relay_info menu_open menu_read menu_pause menu_header menu_run menu_manage menu_main manager_main
+        declare -f die detect_init listeners_ready service_action show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info relay_info menu_open menu_read menu_pause menu_header menu_run menu_manage menu_main manager_main
         # shellcheck disable=SC2016
         printf '\nmanager_main "$@"\n'
     } > "$temporary"
@@ -462,12 +505,12 @@ scrub_dns() {
 main() {
     if (($# == 0)) || [[ ${1:-} == menu ]]; then menu_main; return; fi
     case ${1:-} in
-        info|node|relay|status) manager_main "$@"; return ;;
+        info|node|relay|status|cert-reload) manager_main "$@"; return ;;
         --upgrade) (($# == 1)) || die '--upgrade does not accept installation options.'; upgrade_manager; return ;;
     esac
     local domain='' port=2096 uuid='' cert='' key='' renew=0 version='' work=''
     local mode=server target_host='' target_port='' network=tcp
-    local arch asset expected expiry method email hook label
+    local arch asset expected expiry method email hook label init
     local -a labels
     while (($#)); do
         case "$1" in
@@ -508,11 +551,10 @@ HELP
         esac
     done
     [[ $EUID == 0 ]] || die 'Run as root.'
-    [[ ! -e $BASE && ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service ]] || die 'Installation exists; use vless-lite info. Existing files will not be overwritten.'
+    [[ ! -e $BASE && ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service && ! -e /etc/init.d/vless-lite ]] || die 'Installation exists; use vless-lite info. Existing files will not be overwritten.'
     [[ ! -e /usr/local/bin/dex-lite && ! -L /usr/local/bin/dex-lite ]] || die '/usr/local/bin/dex-lite already exists.'
-    [[ -d /run/systemd/system ]] || die 'Requires systemd inside the container.'
     . /etc/os-release
-    [[ $ID == debian && ( $VERSION_ID == 12 || $VERSION_ID == 13 ) ]] || die 'Supported systems: Debian 12/13.'
+    [[ $ID == alpine && $VERSION_ID == 3.* || $ID == debian && ( $VERSION_ID == 12 || $VERSION_ID == 13 ) ]] || die 'Supported systems: Debian 12/13 or Alpine 3.x.'
     [[ $mode == server || $mode == relay ]] || die 'Mode must be server or relay.'
     port=$(parse_port "$port")
     if [[ $mode == server ]]; then
@@ -539,10 +581,19 @@ HELP
         [[ $port != "$target_port" || ( $target_host != 127.0.0.1 && $target_host != ::1 && $target_host != localhost ) ]] || die 'Relay cannot point to its own listening port.'
     fi
     case $(uname -m) in x86_64) arch=64 ;; aarch64|arm64) arch=arm64-v8a ;; *) die 'Supported CPU architectures: amd64/arm64.' ;; esac
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends ca-certificates curl jq unzip iproute2 util-linux
-    if [[ $mode == server ]]; then apt-get install -y --no-install-recommends openssl qrencode; fi
+    if [[ $ID == alpine ]]; then
+        apk add --no-cache bash ca-certificates curl jq unzip iproute2-ss flock openrc
+        if [[ $mode == server ]]; then apk add --no-cache openssl libqrencode-tools; fi
+    else
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl jq unzip iproute2 util-linux
+        if [[ $mode == server ]]; then apt-get install -y --no-install-recommends openssl qrencode; fi
+    fi
+    init=$(detect_init)
+    [[ $ID != debian || $init == systemd ]] || die 'Debian 安装需要 systemd。'
+    [[ $ID != alpine || $init == openrc ]] || die 'Alpine 安装需要 OpenRC。'
+    [[ $init != openrc || -f /run/openrc/softlevel ]] || die 'OpenRC 尚未启动；请在正常启动的 Alpine LXC 中安装。'
     port_available "$port" "$network" || die "Listening port $port is already in use."
     work=$(mktemp -d /tmp/vless-lite.XXXXXX)
     cleanup_work=$work
@@ -560,9 +611,15 @@ HELP
     [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || die 'Missing official SHA256 digest.'
     printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c -
     unzip -q "$work/$asset" xray -d "$work"
-    getent group vless-lite >/dev/null || groupadd --system vless-lite
-    id vless-lite >/dev/null 2>&1 || useradd --system --gid vless-lite --home-dir /nonexistent --shell /usr/sbin/nologin vless-lite
+    if [[ $ID == alpine ]]; then
+        grep -q '^vless-lite:' /etc/group || addgroup -S vless-lite
+        id vless-lite >/dev/null 2>&1 || adduser -S -D -H -h /nonexistent -s /sbin/nologin -G vless-lite vless-lite
+    else
+        getent group vless-lite >/dev/null || groupadd --system vless-lite
+        id vless-lite >/dev/null 2>&1 || useradd --system --gid vless-lite --home-dir /nonexistent --shell /usr/sbin/nologin vless-lite
+    fi
     install -d -o root -g vless-lite -m 0750 "$BASE"
+    [[ -d /usr/local/bin ]] || install -d -m 0755 /usr/local/bin
     install -m 0755 "$work/xray" /usr/local/bin/vless-lite-xray
     if [[ $mode == server ]]; then
         install -d -o root -g vless-lite -m 0750 "$BASE/tls"
@@ -593,10 +650,11 @@ HELP
             chmod 0700 "$ACME_HOME/acme.sh"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --register-account --server letsencrypt -m "$email"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue --server letsencrypt --dns dns_cf -d "$domain" --keylength ec-256
-            hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if systemctl cat vless-lite.service >/dev/null 2>&1; then systemctl try-restart vless-lite.service; fi"
+            hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if [ -x /usr/local/bin/vless-lite ]; then /usr/local/bin/vless-lite cert-reload; fi"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" --ecc --fullchain-file "$BASE/tls/fullchain.pem" --key-file "$BASE/tls/key.pem" --reloadcmd "$hook"
             if ((renew == 0)); then scrub_dns; fi
         fi
+        unset CF_Token CF_Key CF_Email CF_Account_ID CF_Zone_ID
         openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkend 0 || die 'Expired certificate.'
         openssl x509 -in "$BASE/tls/fullchain.pem" -noout -checkhost "$domain" | grep -Fq 'does match certificate' || die 'Certificate hostname mismatch.'
         [[ $(openssl x509 -in "$BASE/tls/fullchain.pem" -pubkey -noout | openssl sha256) == $(openssl pkey -in "$BASE/tls/key.pem" -pubout -passin pass: | openssl sha256) ]] || die 'Certificate/private key mismatch.'
@@ -610,6 +668,7 @@ HELP
     chown root:vless-lite "$BASE/config.json"
     chmod 0640 "$BASE/config.json"
     /usr/local/bin/vless-lite-xray run -test -config "$BASE/config.json"
+    if [[ $init == systemd ]]; then
     cat > /etc/systemd/system/vless-lite.service <<'UNIT'
 [Unit]
 Description=Dex Lite nodes and port relays
@@ -626,7 +685,30 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 UNIT
+    else
+        cat > /etc/init.d/vless-lite <<'UNIT'
+#!/sbin/openrc-run
+description="Dex Lite nodes and port relays"
+command="/usr/local/bin/vless-lite-xray"
+command_args="run -config /etc/vless-lite/config.json"
+command_user="vless-lite:vless-lite"
+supervisor="supervise-daemon"
+pidfile="/run/vless-lite/supervisor.pid"
+output_log="/var/log/vless-lite.log"
+error_log="/var/log/vless-lite.log"
+respawn_delay=5
+umask="0077"
+depend() { after net; }
+start_pre() {
+    checkpath -d -m 0755 -o vless-lite:vless-lite /run/vless-lite
+    checkpath -f -m 0640 -o vless-lite:vless-lite /var/log/vless-lite.log
+    "$command" run -test -config /etc/vless-lite/config.json >/dev/null 2>&1
+}
+UNIT
+        chmod 0755 /etc/init.d/vless-lite
+    fi
     if ((renew)); then
+    if [[ $init == systemd ]]; then
         cat > /etc/systemd/system/vless-lite-renew.service <<UNIT
 [Unit]
 Description=Renew VLESS TLS certificate
@@ -644,13 +726,20 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
+    else
+        apk add --no-cache busybox-openrc
+        install -d -m 0755 /etc/periodic/daily
+        printf '#!/bin/sh\nexec %s/acme.sh --cron --home %s\n' "$ACME_HOME" "$ACME_HOME" > /etc/periodic/daily/vless-lite-renew
+        chmod 0700 /etc/periodic/daily/vless-lite-renew
+        rc-update add crond default
+        if ! rc-service -q crond status; then rc-service crond start 8>&- 9>&-; fi
+    fi
     fi
     write_manager
-    systemctl daemon-reload
-    systemctl enable --now vless-lite.service
+    service_action start
     sleep 2
-    systemctl is-active --quiet vless-lite.service || die 'Service failed; check journalctl -u vless-lite.'
-    if ((renew)); then systemctl enable --now vless-lite-renew.timer; fi
+    service_action active || die 'Service failed; check system logs or /var/log/vless-lite.log.'
+    if ((renew)) && [[ $init == systemd ]]; then systemctl enable --now vless-lite-renew.timer; fi
     if [[ $mode == server ]]; then
         expiry=$(openssl x509 -in "$BASE/tls/fullchain.pem" -noout -enddate)
         printf '\nTLS %s\n' "$expiry"

@@ -24,7 +24,7 @@
 - 生成的独立管理命令在 Linux 伪终端中实际打开 `/dev/tty`，检查中文四项菜单、ANSI 颜色和选择 `0` 正常退出。
 - 所有测试服务、配置、依赖均在临时目录或临时进程中运行，未安装或替换 vm1225 的现有服务。
 
-上述 vm1225 管理测试仅替换了 `systemctl` 控制接口：每次重启实际运行真实 Xray 进程；未在宿主机创建管理服务。这验证了参数处理、配置生成、真实流量和回滚逻辑，不代表完整安装/升级已验收。另见下方真实 LXC/systemd 测试。
+上述 vm1225 管理测试替换服务控制接口：每次重启实际运行真实 Xray 进程；未在宿主机创建管理服务。这验证了参数处理、配置生成、真实流量和回滚逻辑，不代表完整安装/升级已验收。另见下方真实 LXC/systemd 和 Alpine/OpenRC 测试。
 
 复现：在 Linux 主机准备 `jq`、`qrencode`、`openssl`、`curl`、`ss`、`flock`、Python 3 和 Xray，然后以 root 执行：
 
@@ -54,11 +54,29 @@ Cloudflare DNS-01 单次签发和清理 DNS 验证记录在现有 LXC 成功执�
 
 这是现有 LXC 中的真实中转运行与管理测试，没有在全新容器中从零安装；测试从容器内部连接中转入口，未验收外部客户端经公网/NAT 入口连接这些临时端口。
 
+## Alpine 3.22 / OpenRC 安装与运行
+
+测试使用两个全新的 `alpine:3.22` amd64 Docker 容器，均为 `--memory=128m --memory-swap=256m`，未授予 privileged 或额外网络管理能力。使用 Docker init 回收后台进程，并准备 OpenRC 运行状态文件；这是 OpenRC 服务工具的真实运行验证，不是原生 Alpine LXC 引导测试。
+
+- 使用真实 `apk` 安装依赖、创建专用用户、生成配置和 OpenRC 服务；官方 Xray 26.10.31 下载及 SHA256 校验成功。
+- Server 模式使用测试域名和自备测试证书完成安装，终端输出信息、真实二维码与链接。客户端显式信任测试 CA，未跳过 TLS 身份校验。
+- OpenRC 下运行两个 VLESS 节点和三条中转，共用一个核心。节点经中转的 HTTPS 请求、普通 HTTPS 转发均 HTTP 200；原生 UDP DNS 返回有效响应。
+- 实际执行连续新增、查看、删除、重启、证书加载与管理工具升级；验证默认 runlevel 的开机启动链接，升级前后配置和元数据 SHA256 不变。
+- 核心以 `vless-lite` 用户、`0077` umask 运行；检查 supervisor 未继承配置锁和合成 Cloudflare 凭据。补上实际监听检查，避免仅 supervisor 存活就判定启动成功。
+- 已安装的 `dex-lite` 在 Docker 真正的交互终端内显示中文 1/2/9/0 菜单和颜色，`9` 查看节点二维码/状态、返回与 `0` 退出均通过。
+- 另一个容器完成纯中转安装，无 TLS 目录、无 `qrencode` 工具。两条独立 HTTPS 转发均 HTTP 200，UDP 转发、连续增删和 OpenRC 状态检查通过。
+- 可选续期依赖 `busybox-openrc`、`crond` 的安装、runlevel 注册与启动检查通过；未进行真实 DNS 证书签发或定时续期。
+- Server 测试五条入站活动期间，核心 RSS 约 32 MiB；测试末整容器约 64 MiB（包含临时客户端、cron/syslog、页缓存等）。纯中转测试末整容器约 55 MiB。两容器 `memory.max=134217728`，`memory.events.max=0`、`oom=0`、`oom_kill=0`。这些是少量请求下的测量，不代表高并发上限。
+- Docker 的只读 cgroup 文件系统使 OpenRC 输出创建 cgroup 目录的警告；未修改宿主机权限，服务仍通过了真实监听和流量检查。
+- 新增 `tests/alpine-runtime.sh` 用于上述一次性容器的真实 OpenRC 回归，带测试容器标记检查，避免直接用于生产节点。
+- 修改后再次执行 vm1225 的 ShellCheck 和完整 `tests/smoke.sh`，包括菜单、节点、中转、UDP、回滚和旧版迁移，全部通过。
+
 ## 尚未验证
 
 - 在全新 128 MiB LXC 中从零运行整个安装器，包括 APT、用户创建、systemd 和生产证书签发。
 - arm64 实机安装。
 - 自动续期定时器实际触发一次证书更新。
+- Alpine 的生产 DNS-01 签发/实际续期，以及正常 OpenRC 引导的原生 Alpine LXC。
 - 新版管理工具在实际安装目录中的升级和真实 systemd 重启回滚。
 - 高并发和长时间内存压力测试、外部客户端经公网/NAT 入口的 UDP 中转。
 

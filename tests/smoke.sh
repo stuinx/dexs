@@ -34,6 +34,7 @@ validate_state "$BASE/state.json"
 render_state "$BASE/state.json" > "$BASE/config.json"
 jq -e '.inbounds[0].streamSettings.wsSettings.path == "/123456" and .inbounds[0].streamSettings.security == "tls"' "$BASE/config.json" >/dev/null
 "$XRAY_BIN" run -test -config "$BASE/config.json" > "$taskdir/check.log" 2>&1
+if listeners_ready; then exit 1; fi
 node_info main > "$taskdir/info.txt"
 grep -q '^DoH:       Disabled$' "$taskdir/info.txt"
 grep -q '^Path:      /123456$' "$taskdir/info.txt"
@@ -49,7 +50,7 @@ grep -q '^OTHER_SETTING=' "$ACME_HOME/account.conf"
 echo 'One-time DNS credential cleanup: passed'
 
 # Only the service controller is replaced; every restart uses the real Xray binary.
-systemctl() {
+service_action() {
     case "$1" in
         restart)
             if [[ -f $BASE/pid ]]; then
@@ -60,12 +61,12 @@ systemctl() {
             "$XRAY_BIN" run -config "$BASE/config.json" > "$taskdir/server.log" 2>&1 9>&- &
             printf '%s\n' "$!" > "$BASE/pid"
             ;;
-        is-active) kill -0 "$(cat "$BASE/pid")" 2>/dev/null ;;
-        --no-pager) printf 'active (running)\n' ;;
+        active) kill -0 "$(cat "$BASE/pid")" 2>/dev/null ;;
+        status) printf 'active (running)\n' ;;
         *) return 1 ;;
     esac
 }
-systemctl restart vless-lite.service
+service_action restart
 (manager_main node add extra 29346 00000000-0000-4000-8000-000000654321) > "$taskdir/add.txt"
 (manager_main relay add transit 29347 127.0.0.1 29344 tcp)
 (manager_main relay add udp-test 29348 127.0.0.1 29349 tcp,udp)
@@ -75,6 +76,7 @@ systemctl restart vless-lite.service
 grep -q '/654321' "$taskdir/extra-info.txt"
 (manager_main relay info transit) | jq -e '.port == 29347 and .target_port == 29344' >/dev/null
 [[ $(jq '.inbounds | length' "$BASE/config.json") == 4 ]]
+listeners_ready
 echo 'Node and relay add/list/info, shared core configuration: passed'
 
 cat > "$taskdir/client.json" <<'JSON'
@@ -142,7 +144,7 @@ if (manager_main node add duplicate 29344) >/dev/null 2>&1; then exit 1; fi
 touch "$BASE/fail-next-restart"
 if (manager_main relay add rollback 29350 127.0.0.1 29344) > "$taskdir/rollback.txt" 2>&1; then exit 1; fi
 [[ $(sha256sum "$BASE/config.json" "$BASE/state.json") == "$before" ]]
-systemctl is-active --quiet vless-lite.service
+service_action active
 grep -q 'previous configuration restored' "$taskdir/rollback.txt"
 echo 'Invalid input rejection and failed-restart rollback: passed'
 (manager_main node del extra)
