@@ -134,7 +134,7 @@ managed_config_matches() {
 
 apply_state() {
     local next=$1 transaction
-    managed_config_matches "$BASE/state.json" || { printf 'Configuration was edited outside dex-lite; refusing to overwrite it.\n' >&2; return 1; }
+    managed_config_matches "$BASE/state.json" || { printf 'Configuration was edited outside dexs; refusing to overwrite it.\n' >&2; return 1; }
     validate_state "$next" || { printf 'Invalid configuration: check names, ports and targets.\n' >&2; return 1; }
     transaction=$(mktemp -d "$BASE/.transaction.XXXXXX")
     if ! { cp "$next" "$transaction/state.json" &&
@@ -205,7 +205,7 @@ menu_header() {
     fi
     printf '\n%b----------------------------------------------------------------%b\n' "$blue" "$reset"
     printf '%bKernel: %s%b\n' "$blue" "$(uname -r)" "$reset"
-    printf '%b============ DEX LITE · SERVER =================================%b\n' "$green" "$reset"
+    printf '%b============ DEXS · SERVER =================================%b\n' "$green" "$reset"
     printf '%b  VLESS + WS + TLS                 TCP / UDP 中转%b\n' "$green" "$reset"
     printf '%b  Server 节点: %s                 中转规则: %s%b\n' "$cyan" "$nodes" "$relays" "$reset"
     printf '%b================================================================%b\n\n' "$green" "$reset"
@@ -325,7 +325,7 @@ menu_main() {
                     first=$(jq -r '.nodes[0].name // .relays[0].name // ""' "$BASE/state.json")
                     [[ -z $first ]] || menu_run info "$first"
                     menu_run status
-                else printf '尚未安装 dex-lite。\n'; fi
+                else printf '尚未安装 dexs。\n'; fi
                 menu_pause ;;
             0) return ;;
             *) printf '请输入 1、2、9 或 0。\n'; menu_pause ;;
@@ -338,18 +338,18 @@ manager_main() {
     if (($# == 0)) || [[ ${1:-} == menu ]]; then menu_main; return; fi
     if [[ ${1:-help} == help || ${1:-} == --help ]]; then
         cat <<'HELP'
-Dex Lite — one Xray process for VLESS WS TLS nodes and port relays
-  dex-lite                                  Interactive menu (1/2/9/0)
-  dex-lite info [NAME]                       Node + QR or relay details (default main)
-  dex-lite node list
-  dex-lite node add NAME PORT [UUID]         Reuse installed hostname/certificate
-  dex-lite node info NAME
-  dex-lite node del NAME
-  dex-lite relay list
-  dex-lite relay add NAME PORT HOST TARGET_PORT [tcp|udp|tcp,udp]
-  dex-lite relay info NAME
-  dex-lite relay del NAME
-  dex-lite status
+dexs — one Xray process for VLESS WS TLS nodes and port relays
+  dexs                                  Interactive menu (1/2/9/0)
+  dexs info [NAME]                       Node + QR or relay details (default main)
+  dexs node list
+  dexs node add NAME PORT [UUID]         Reuse installed hostname/certificate
+  dexs node info NAME
+  dexs node del NAME
+  dexs relay list
+  dexs relay add NAME PORT HOST TARGET_PORT [tcp|udp|tcp,udp]
+  dexs relay info NAME
+  dexs relay del NAME
+  dexs status
 Changes restart Xray and briefly disconnect existing sessions.
 Relays forward raw traffic; TLS/SNI, UUID and WS Path belong to the final server.
 HELP
@@ -372,7 +372,7 @@ HELP
             else relay_info "$name"; fi
             return ;;
         node|relay) kind=$action; command=${2:-list} ;;
-        *) die 'Unknown command; use dex-lite help.' ;;
+        *) die 'Unknown command; use dexs help.' ;;
     esac
     case "$command" in
         list)
@@ -385,7 +385,7 @@ HELP
             fi
             return ;;
         info)
-            (($# == 3)) || die "Usage: dex-lite $kind info NAME"
+            (($# == 3)) || die "Usage: dexs $kind info NAME"
             if [[ $kind == node ]]; then node_info "$3"; else
                 relay_info "$3"
             fi
@@ -397,14 +397,14 @@ HELP
     if [[ $command == add ]]; then
         if [[ $kind == node ]]; then
             [[ -n $(jq -r .domain "$BASE/state.json") && -r $BASE/tls/fullchain.pem && -r $BASE/tls/key.pem ]] || die 'This relay-only installation has no TLS setup; node creation is unavailable.'
-            (($# == 4 || $# == 5)) || die 'Usage: dex-lite node add NAME PORT [UUID]'
+            (($# == 4 || $# == 5)) || die 'Usage: dexs node add NAME PORT [UUID]'
             port=$(parse_port "$4")
             uuid=${5:-$(cat /proc/sys/kernel/random/uuid)}
             uuid=${uuid,,}
             valid_uuid "$uuid" || die 'Invalid UUID.'
             network=tcp
         else
-            (($# == 6 || $# == 7)) || die 'Usage: dex-lite relay add NAME PORT HOST TARGET_PORT [NETWORK]'
+            (($# == 6 || $# == 7)) || die 'Usage: dexs relay add NAME PORT HOST TARGET_PORT [NETWORK]'
             port=$(parse_port "$4")
             host=$5
             valid_host "$host" || die 'Invalid target hostname/IP; do not include a scheme, port or IPv6 brackets.'
@@ -416,7 +416,7 @@ HELP
         port_available "$port" "$network" || die "Listening port $port is already in use."
         jq -e --arg kind "${kind}s" --arg name "$name" '.[$kind] | all(.name != $name)' "$BASE/state.json" >/dev/null || die "Name already exists: $name"
     else
-        (($# == 3)) || die "Usage: dex-lite $kind del NAME"
+        (($# == 3)) || die "Usage: dexs $kind del NAME"
         jq -e --arg kind "${kind}s" --arg name "$name" '.[$kind][] | select(.name==$name)' "$BASE/state.json" >/dev/null || die "Unknown $kind: $name"
     fi
     next=$(mktemp "$BASE/.next.XXXXXX")
@@ -439,7 +439,7 @@ HELP
 
 write_manager() {
     local temporary
-    temporary=$(mktemp "$MANAGER_DIR/.vless-lite.XXXXXX")
+    temporary=$(mktemp "$MANAGER_DIR/.dexs.XXXXXX")
     {
         cat <<'MANAGER'
 #!/usr/bin/env bash
@@ -455,16 +455,26 @@ MANAGER
         printf '\nmanager_main "$@"\n'
     } > "$temporary"
     chmod 0755 "$temporary"
-    mv "$temporary" "$MANAGER_DIR/vless-lite"
-    ln -sfn "$MANAGER_DIR/vless-lite" "$MANAGER_DIR/dex-lite"
+    mv "$temporary" "$MANAGER_DIR/dexs"
+    ln -sfn "$MANAGER_DIR/dexs" "$MANAGER_DIR/vless-lite"
+    ln -sfn "$MANAGER_DIR/dexs" "$MANAGER_DIR/dex-lite"
 }
 
 upgrade_manager() {
-    local candidate
+    local candidate alias target
     [[ $EUID == 0 ]] || die 'Run as root.'
-    [[ -x $XRAY_BIN && -f $BASE/config.json ]] || die 'An existing vless-lite installation is required.'
-    [[ ! -e $MANAGER_DIR/dex-lite || -L $MANAGER_DIR/dex-lite ]] || die 'dex-lite command already exists and is not a symlink.'
-    [[ ! -L $MANAGER_DIR/dex-lite || $(readlink "$MANAGER_DIR/dex-lite") == "$MANAGER_DIR/vless-lite" ]] || die 'dex-lite points to another program.'
+    [[ -x $XRAY_BIN && -f $BASE/config.json ]] || die 'An existing dexs/vless-lite installation is required.'
+    if [[ -e $MANAGER_DIR/dexs || -L $MANAGER_DIR/dexs ]]; then
+        [[ -f $MANAGER_DIR/dexs && ! -L $MANAGER_DIR/dexs && -L $MANAGER_DIR/vless-lite && $(readlink "$MANAGER_DIR/vless-lite") == "$MANAGER_DIR/dexs" ]] || die 'dexs already exists and is not managed by this installation.'
+    fi
+    for alias in vless-lite dex-lite; do
+        if [[ -L $MANAGER_DIR/$alias ]]; then
+            target=$(readlink "$MANAGER_DIR/$alias")
+            [[ $target == "$MANAGER_DIR/dexs" || ( $alias == dex-lite && $target == "$MANAGER_DIR/vless-lite" ) ]] || die "$alias points to another program."
+        elif [[ -e $MANAGER_DIR/$alias ]]; then
+            [[ $alias == vless-lite && -f $MANAGER_DIR/$alias ]] || die "$alias already exists and is not managed by this installation."
+        fi
+    done
     exec 9> "$BASE/.lock"
     flock -x 9
     if [[ ! -f $BASE/state.json ]]; then
@@ -492,7 +502,7 @@ upgrade_manager() {
     fi
     validate_state "$BASE/state.json" || die 'Invalid management metadata.'
     write_manager
-    printf 'Dex Lite management upgraded; use dex-lite help.\n'
+    printf 'dexs management upgraded; use dexs help.\n'
 }
 
 scrub_dns() {
@@ -551,7 +561,8 @@ HELP
         esac
     done
     [[ $EUID == 0 ]] || die 'Run as root.'
-    [[ ! -e $BASE && ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service && ! -e /etc/init.d/vless-lite ]] || die 'Installation exists; use vless-lite info. Existing files will not be overwritten.'
+    [[ ! -e $BASE && ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service && ! -e /etc/init.d/vless-lite ]] || die 'Installation exists; run --upgrade. Existing files will not be overwritten.'
+    [[ ! -e /usr/local/bin/dexs && ! -L /usr/local/bin/dexs ]] || die '/usr/local/bin/dexs already exists.'
     [[ ! -e /usr/local/bin/dex-lite && ! -L /usr/local/bin/dex-lite ]] || die '/usr/local/bin/dex-lite already exists.'
     . /etc/os-release
     [[ $ID == alpine && $VERSION_ID == 3.* || $ID == debian && ( $VERSION_ID == 12 || $VERSION_ID == 13 ) ]] || die 'Supported systems: Debian 12/13 or Alpine 3.x.'
@@ -650,7 +661,7 @@ HELP
             chmod 0700 "$ACME_HOME/acme.sh"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --register-account --server letsencrypt -m "$email"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue --server letsencrypt --dns dns_cf -d "$domain" --keylength ec-256
-            hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if [ -x /usr/local/bin/vless-lite ]; then /usr/local/bin/vless-lite cert-reload; fi"
+            hook="chown root:vless-lite '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && chmod 640 '$BASE/tls/fullchain.pem' '$BASE/tls/key.pem' && if [ -x /usr/local/bin/dexs ]; then /usr/local/bin/dexs cert-reload; fi"
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" --ecc --fullchain-file "$BASE/tls/fullchain.pem" --key-file "$BASE/tls/key.pem" --reloadcmd "$hook"
             if ((renew == 0)); then scrub_dns; fi
         fi
@@ -671,7 +682,7 @@ HELP
     if [[ $init == systemd ]]; then
     cat > /etc/systemd/system/vless-lite.service <<'UNIT'
 [Unit]
-Description=Dex Lite nodes and port relays
+Description=dexs nodes and port relays
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -688,7 +699,7 @@ UNIT
     else
         cat > /etc/init.d/vless-lite <<'UNIT'
 #!/sbin/openrc-run
-description="Dex Lite nodes and port relays"
+description="dexs nodes and port relays"
 command="/usr/local/bin/vless-lite-xray"
 command_args="run -config /etc/vless-lite/config.json"
 command_user="vless-lite:vless-lite"

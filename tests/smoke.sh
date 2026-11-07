@@ -4,7 +4,7 @@ test_xray=${XRAY_BIN:?Set XRAY_BIN to the Linux Xray binary}
 # shellcheck disable=SC1091
 source "$(dirname "$0")/../install.sh"
 XRAY_BIN=$test_xray
-taskdir=$(mktemp -d /tmp/dex-lite-smoke.XXXXXX)
+taskdir=$(mktemp -d /tmp/dexs-smoke.XXXXXX)
 BASE="$taskdir/base"
 server_home=$BASE
 export CONFIG_GROUP=root
@@ -132,8 +132,8 @@ python3 - <<'PY'
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     sock.settimeout(5)
-    sock.sendto(b'dex-lite-udp-test', ('127.0.0.1', 29348))
-    assert sock.recv(2048) == b'dex-lite-udp-test'
+    sock.sendto(b'dexs-udp-test', ('127.0.0.1', 29348))
+    assert sock.recv(2048) == b'dexs-udp-test'
 print('Native UDP relay echo: passed')
 PY
 
@@ -158,7 +158,7 @@ jq '.log.loglevel="error"' "$BASE/config.json" > "$taskdir/edited.json"
 cp "$taskdir/edited.json" "$BASE/config.json"
 if (manager_main relay add drift 29350 127.0.0.1 29344) > "$taskdir/drift.txt" 2>&1; then exit 1; fi
 cmp -s "$taskdir/edited.json" "$BASE/config.json"
-grep -q 'edited outside dex-lite' "$taskdir/drift.txt"
+grep -q 'edited outside dexs' "$taskdir/drift.txt"
 cp "$taskdir/config.saved.json" "$BASE/config.json"
 echo 'External configuration edit protection: passed'
 
@@ -203,16 +203,31 @@ jq '.domain as $domain | .nodes[0] | {domain:$domain,port,uuid,path:("/"+.uuid[-
 jq '{version:1,domain,nodes:[{name:"main",port,uuid}],relays:[]}' "$BASE/node.json" > "$taskdir/legacy-state.json"
 render_state "$taskdir/legacy-state.json" | jq 'del(.inbounds[].tag,.outbounds[].tag)' > "$BASE/config.json"
 before=$(sha256sum "$BASE/config.json")
+printf 'unrelated command\n' > "$MANAGER_DIR/dexs"
+if (upgrade_manager) > "$taskdir/name-collision.txt" 2>&1; then exit 1; fi
+grep -q '^unrelated command$' "$MANAGER_DIR/dexs"
+rm "$MANAGER_DIR/dexs"
+printf '#!/bin/sh\necho legacy\n' > "$MANAGER_DIR/vless-lite"
+chmod 0755 "$MANAGER_DIR/vless-lite"
+ln -s "$MANAGER_DIR/vless-lite" "$MANAGER_DIR/dex-lite"
 (upgrade_manager)
 validate_state "$BASE/state.json"
 [[ $(jq -r '.nodes[0].uuid' "$BASE/state.json") == 00000000-0000-4000-8000-000000123456 ]]
 [[ $(sha256sum "$BASE/config.json") == "$before" ]]
-bash "$MANAGER_DIR/dex-lite" help > "$taskdir/manager-help.txt"
+[[ -f $MANAGER_DIR/dexs && ! -L $MANAGER_DIR/dexs ]]
+[[ $(readlink "$MANAGER_DIR/vless-lite") == "$MANAGER_DIR/dexs" ]]
+[[ $(readlink "$MANAGER_DIR/dex-lite") == "$MANAGER_DIR/dexs" ]]
+(upgrade_manager)
+for alias in dexs dex-lite vless-lite; do
+    bash "$MANAGER_DIR/$alias" help > "$taskdir/$alias-help.txt"
+    grep -q 'dexs node add' "$taskdir/$alias-help.txt"
+done
+bash "$MANAGER_DIR/dexs" help > "$taskdir/manager-help.txt"
 grep -q 'relay add' "$taskdir/manager-help.txt"
 printf '0\n' > "$taskdir/menu-input"
-(exec 7< "$taskdir/menu-input"; bash "$MANAGER_DIR/dex-lite") > "$taskdir/installed-menu" 2>&1
+(exec 7< "$taskdir/menu-input"; bash "$MANAGER_DIR/dexs") > "$taskdir/installed-menu" 2>&1
 grep -Fq '9. 查看' "$taskdir/installed-menu"
-python3 - "$MANAGER_DIR/dex-lite" <<'PY'
+python3 - "$MANAGER_DIR/dexs" <<'PY'
 import os
 import pty
 import select
