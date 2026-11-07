@@ -7,6 +7,24 @@ XRAY_BIN=$test_xray
 taskdir=$(mktemp -d /tmp/dexs-smoke.XXXXXX)
 BASE="$taskdir/base"
 server_home=$BASE
+test_incomplete_recovery() {
+    local BASE="$taskdir/incomplete"
+    mkdir -p "$BASE/tls"
+    prepare_install_directory > "$taskdir/recovery-output"
+    [[ ! -e $BASE ]]
+    [[ -d $(find "$taskdir" -path '*/incomplete.incomplete.*/install/tls' -print -quit) ]]
+    mkdir -p "$BASE/tls"
+    printf 'preserve\n' > "$BASE/tls/key.pem"
+    if (prepare_install_directory) > "$taskdir/recovery-error" 2>&1; then exit 1; fi
+    grep -qx preserve "$BASE/tls/key.pem"
+    rm "$BASE/tls/key.pem"
+    rmdir "$BASE/tls" "$BASE"
+    ln -s "$taskdir" "$BASE"
+    if (prepare_install_directory) > "$taskdir/recovery-error" 2>&1; then exit 1; fi
+    [[ -L $BASE ]]
+}
+test_incomplete_recovery
+echo 'Empty incomplete installation recovery, existing file and symlink protection: passed'
 export CONFIG_GROUP=root
 client_pid=''
 echo_pid=''

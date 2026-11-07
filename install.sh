@@ -310,6 +310,19 @@ install_wizard() {
     if ((result != 0)); then printf '安装未完成，请检查上方提示。\n' >&2; fi
 }
 
+prepare_install_directory() {
+    local backup
+    [[ -e $BASE || -L $BASE ]] || return 0
+    [[ -d $BASE && ! -L $BASE && ! -L $BASE/tls ]] || die "Existing installation path is not a regular directory: $BASE"
+    if [[ -n $(find "$BASE" -mindepth 1 ! -path "$BASE/tls" -print -quit) ]] ||
+        [[ -e $BASE/tls && ! -d $BASE/tls ]]; then
+        die "Existing configuration or files found in $BASE; refusing to overwrite. Use --upgrade only for a completed installation."
+    fi
+    backup=$(mktemp -d "${BASE}.incomplete.XXXXXX")
+    mv "$BASE" "$backup/install"
+    printf 'Preserved empty incomplete installation at %s/install; retrying installation.\n' "$backup"
+}
+
 menu_main() {
     [[ $EUID == 0 ]] || die 'Run as root.'
     menu_open
@@ -568,7 +581,7 @@ HELP
         esac
     done
     [[ $EUID == 0 ]] || die 'Run as root.'
-    [[ ! -e $BASE && ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service && ! -e /etc/init.d/vless-lite ]] || die 'Installation exists; run --upgrade. Existing files will not be overwritten.'
+    [[ ! -e /usr/local/bin/vless-lite && ! -e /etc/systemd/system/vless-lite.service && ! -e /etc/init.d/vless-lite ]] || die 'Installation exists; run --upgrade. Existing files will not be overwritten.'
     [[ ! -e /usr/local/bin/dexs && ! -L /usr/local/bin/dexs ]] || die '/usr/local/bin/dexs already exists.'
     [[ ! -e /usr/local/bin/dex-lite && ! -L /usr/local/bin/dex-lite ]] || die '/usr/local/bin/dex-lite already exists.'
     . /etc/os-release
@@ -599,6 +612,7 @@ HELP
         [[ $port != "$target_port" || ( $target_host != 127.0.0.1 && $target_host != ::1 && $target_host != localhost ) ]] || die 'Relay cannot point to its own listening port.'
     fi
     case $(uname -m) in x86_64) arch=64 ;; aarch64|arm64) arch=arm64-v8a ;; *) die 'Supported CPU architectures: amd64/arm64.' ;; esac
+    prepare_install_directory
     if [[ $ID == alpine ]]; then
         apk add --no-cache bash ca-certificates curl jq unzip iproute2-ss flock openrc
         if [[ $mode == server ]]; then apk add --no-cache openssl libqrencode-tools; fi

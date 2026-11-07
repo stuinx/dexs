@@ -145,6 +145,10 @@ dexs relay add game 33347 target.example.com 12345 tcp,udp
 
 元数据位于 `/etc/vless-lite/state.json`。管理命令使用文件锁串行处理修改；如果发现核心配置被手工修改，会拒绝覆盖，避免丢失自定义内容。节点增删不重新申请证书，不增加常驻服务。
 
+## 安装中断后重试
+
+若在填写 Cloudflare 凭据之前退出，可能留下空的 `/etc/vless-lite` 或 `tls` 目录。重新运行安装器时会将此空目录移到 `/etc/vless-lite.incomplete.XXXXXX/install` 保存，然后继续安装。已有证书、配置、元数据或其他文件的目录不会自动处理；完整安装才使用 `--upgrade`。
+
 ## 从初版升级
 
 已通过本项目初版安装的机器可运行：
