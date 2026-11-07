@@ -61,6 +61,7 @@ systemctl() {
             printf '%s\n' "$!" > "$BASE/pid"
             ;;
         is-active) kill -0 "$(cat "$BASE/pid")" 2>/dev/null ;;
+        --no-pager) printf 'active (running)\n' ;;
         *) return 1 ;;
     esac
 }
@@ -159,6 +160,40 @@ grep -q 'edited outside dex-lite' "$taskdir/drift.txt"
 cp "$taskdir/config.saved.json" "$BASE/config.json"
 echo 'External configuration edit protection: passed'
 
+export MENU_FD=7
+printf '9\n\n1\n2\n\n0\n2\n2\n\n0\n0\n' > "$taskdir/menu-input"
+(exec 7< "$taskdir/menu-input"; manager_main) > "$taskdir/menu-output" 2>&1
+for label in '1. 安装' '2. 中转' '9. 查看' '0. 退出'; do grep -Fq "$label" "$taskdir/menu-output"; done
+grep -q 'QR code:' "$taskdir/menu-output"
+printf '2\n1\nmenu-rule\n29350\n127.0.0.1\n29344\ntcp\n\n4\nmenu-rule\nn\n\n0\n0\n' > "$taskdir/menu-input"
+(exec 7< "$taskdir/menu-input"; manager_main) > "$taskdir/menu-add" 2>&1
+jq -e '.relays[]|select(.name=="menu-rule")' "$BASE/state.json" >/dev/null
+grep -q '已取消' "$taskdir/menu-add"
+printf '2\n4\nmenu-rule\ny\n\n0\n0\n' > "$taskdir/menu-input"
+(exec 7< "$taskdir/menu-input"; manager_main) > "$taskdir/menu-delete" 2>&1
+jq -e '.relays|all(.name!="menu-rule")' "$BASE/state.json" >/dev/null
+printf '1\n1\nbad-port\ninvalid\n\n\n2\n\n0\n0\n' > "$taskdir/menu-input"
+(exec 7< "$taskdir/menu-input"; manager_main) > "$taskdir/menu-error" 2>&1
+grep -q '操作未完成' "$taskdir/menu-error"
+jq -e '.nodes|all(.name!="bad-port")' "$BASE/state.json" >/dev/null
+printf '33346\nnode.example.com\n443\ntcp\n' > "$taskdir/wizard-input"
+(
+    # shellcheck disable=SC2317
+    main() { printf '%s\n' "$@" > "$taskdir/wizard-args"; }
+    exec 7< "$taskdir/wizard-input"; install_wizard relay
+) > "$taskdir/wizard-output" 2>&1
+printf '%s\n' --mode relay --port 33346 --target-host node.example.com --target-port 443 --network tcp > "$taskdir/expected-args"
+cmp -s "$taskdir/wizard-args" "$taskdir/expected-args"
+printf 'node.example.com\n33344\n\n1\nn\n' > "$taskdir/wizard-input"
+(
+    # shellcheck disable=SC2317
+    main() { printf '%s\n' "$@" > "$taskdir/wizard-args"; }
+    exec 7< "$taskdir/wizard-input"; install_wizard server
+) > "$taskdir/wizard-output" 2>&1
+printf '%s\n' --mode server --domain node.example.com --port 33344 > "$taskdir/expected-args"
+cmp -s "$taskdir/wizard-args" "$taskdir/expected-args"
+echo '1/2/9/0 menus, add/delete/cancel, error recovery and installation prompts: passed'
+
 BASE="$taskdir/legacy"
 MANAGER_DIR="$taskdir/bin"
 mkdir -p "$BASE" "$MANAGER_DIR"
@@ -172,4 +207,60 @@ validate_state "$BASE/state.json"
 [[ $(sha256sum "$BASE/config.json") == "$before" ]]
 bash "$MANAGER_DIR/dex-lite" help > "$taskdir/manager-help.txt"
 grep -q 'relay add' "$taskdir/manager-help.txt"
+printf '0\n' > "$taskdir/menu-input"
+(exec 7< "$taskdir/menu-input"; bash "$MANAGER_DIR/dex-lite") > "$taskdir/installed-menu" 2>&1
+grep -Fq '9. 查看' "$taskdir/installed-menu"
+python3 - "$MANAGER_DIR/dex-lite" <<'PY'
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ.pop('MENU_FD', None)
+    os.environ.pop('NO_COLOR', None)
+    os.execv('/bin/bash', ['bash', sys.argv[1]])
+output = b''
+sent = False
+finished = False
+deadline = time.monotonic() + 6
+try:
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.2)[0]:
+            try:
+                chunk = os.read(fd, 8192)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if b'Select:' in output and not sent:
+                os.write(fd, b'0\n')
+                sent = True
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            finished = True
+            assert os.waitstatus_to_exitcode(status) == 0
+            break
+    while not finished and time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            finished = True
+            assert os.waitstatus_to_exitcode(status) == 0
+        else:
+            time.sleep(0.01)
+    assert finished and sent, 'interactive menu did not exit'
+    assert b'\x1b[32m' in output, 'terminal colors missing'
+    for label in ('1. 安装', '2. 中转', '9. 查看', '0. 退出'):
+        assert label.encode() in output
+finally:
+    os.close(fd)
+    if not finished:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+print('Generated menu in a real pseudo-terminal, colors and exit: passed')
+PY
 echo 'Legacy metadata migration and generated management command: passed'

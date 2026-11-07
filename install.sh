@@ -136,11 +136,171 @@ relay_info() {
     jq -e --arg name "$1" '.relays[] | select(.name==$name)' "$BASE/state.json" || die "Unknown relay: $1"
 }
 
+menu_open() {
+    if [[ -z ${MENU_FD:-} ]]; then
+        [[ -r /dev/tty ]] || die '菜单需要终端；非交互安装请使用命令行参数。'
+        exec 8<> /dev/tty
+        MENU_FD=8
+    fi
+}
+
+menu_read() {
+    local destination=$1 prompt=$2
+    printf '%s' "$prompt" >&2
+    IFS= read -r -u "$MENU_FD" "${destination?}"
+}
+
+menu_pause() {
+    read -r -u "$MENU_FD" -p '按 Enter 返回菜单...' || true
+}
+
+menu_header() {
+    local blue='' green='' cyan='' yellow='' red='' reset='' nodes=0 relays=0
+    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+        blue='\033[34m'; green='\033[32m'; cyan='\033[36m'
+        yellow='\033[33m'; red='\033[31m'; reset='\033[0m'
+    fi
+    if [[ -f $BASE/state.json ]]; then
+        nodes=$(jq '.nodes|length' "$BASE/state.json")
+        relays=$(jq '.relays|length' "$BASE/state.json")
+    fi
+    printf '\n%b----------------------------------------------------------------%b\n' "$blue" "$reset"
+    printf '%bKernel: %s%b\n' "$blue" "$(uname -r)" "$reset"
+    printf '%b============ DEX LITE · SERVER =================================%b\n' "$green" "$reset"
+    printf '%b  VLESS + WS + TLS                 TCP / UDP 中转%b\n' "$green" "$reset"
+    printf '%b  Server 节点: %s                 中转规则: %s%b\n' "$cyan" "$nodes" "$relays" "$reset"
+    printf '%b================================================================%b\n\n' "$green" "$reset"
+    printf '%b1. 安装%b\n' "$green" "$reset"
+    printf '%b2. 中转%b\n' "$cyan" "$reset"
+    printf '%b9. 查看%b\n' "$yellow" "$reset"
+    printf '%b0. 退出%b\n\n' "$red" "$reset"
+}
+
+menu_run() {
+    local result
+    set +e
+    ( set -e; manager_main "$@" )
+    result=$?
+    set -e
+    if ((result != 0)); then printf '操作未完成，请根据上方提示检查。\n' >&2; fi
+}
+
+menu_manage() {
+    local kind=$1 title choice name port uuid host target network answer
+    if [[ $kind == node ]]; then title='Server 节点管理'; else title='中转管理'; fi
+    while true; do
+        printf '\n============ %s ============\n' "$title"
+        printf '1. 新增\n2. 列表\n3. 详情'
+        [[ $kind != node ]] || printf ' / 二维码'
+        printf '\n4. 删除\n0. 返回\n\n'
+        menu_read choice 'Select: ' || return 0
+        case "$choice" in
+            1)
+                printf '应用配置会重启 Xray，现有连接将短暂断开。\n'
+                menu_read name '名称: ' || return 0
+                menu_read port '监听端口: ' || return 0
+                if [[ $kind == node ]]; then
+                    menu_read uuid 'UUID（回车自动生成）: ' || return 0
+                    if [[ -n $uuid ]]; then menu_run node add "$name" "$port" "$uuid"; else menu_run node add "$name" "$port"; fi
+                else
+                    menu_read host '目标 IP / 域名: ' || return 0
+                    menu_read target '目标端口: ' || return 0
+                    menu_read network '协议 tcp / udp / tcp,udp（默认 tcp）: ' || return 0
+                    menu_run relay add "$name" "$port" "$host" "$target" "${network:-tcp}"
+                fi ;;
+            2) menu_run "$kind" list ;;
+            3)
+                menu_run "$kind" list
+                menu_read name '查看名称（默认 main）: ' || return 0
+                menu_run "$kind" info "${name:-main}" ;;
+            4)
+                menu_run "$kind" list
+                menu_read name '删除名称: ' || return 0
+                menu_read answer "确认删除 $name 并重启服务？[y/N]: " || return 0
+                if [[ $answer == y || $answer == Y ]]; then menu_run "$kind" del "$name"; else printf '已取消。\n'; fi ;;
+            0) return ;;
+            *) printf '请输入菜单编号。\n' ;;
+        esac
+        menu_pause
+    done
+}
+
+install_wizard() {
+    local mode=$1 domain port uuid cert key renewal host target network method
+    local -a args=(--mode "$mode")
+    if [[ $mode == server ]]; then
+        printf '\n============ 安装 Server 节点 ============\n'
+        menu_read domain '节点域名: ' || return 0
+        menu_read port '监听端口（默认 2096）: ' || return 0
+        menu_read uuid 'UUID（回车自动生成）: ' || return 0
+        args+=(--domain "$domain" --port "${port:-2096}")
+        [[ -z $uuid ]] || args+=(--uuid "$uuid")
+        printf '1. Cloudflare DNS 签发证书\n2. 使用已有证书\n'
+        menu_read method '证书方式（默认 1）: ' || return 0
+        case ${method:-1} in
+            1)
+                menu_read renewal '保留 DNS 凭据以启用自动续期？[y/N]: ' || return 0
+                [[ $renewal != y && $renewal != Y ]] || args+=(--renew) ;;
+            2)
+                menu_read cert '全链证书路径: ' || return 0
+                menu_read key '私钥路径: ' || return 0
+                args+=(--cert-file "$cert" --key-file "$key") ;;
+            *) printf '证书方式无效。\n' >&2; return 0 ;;
+        esac
+    else
+        printf '\n============ 安装纯中转 ============\n'
+        menu_read port '监听端口（默认 2096）: ' || return 0
+        menu_read host '目标 IP / 域名: ' || return 0
+        menu_read target '目标端口: ' || return 0
+        menu_read network '协议 tcp / udp / tcp,udp（默认 tcp）: ' || return 0
+        args+=(--port "${port:-2096}" --target-host "$host" --target-port "$target" --network "${network:-tcp}")
+    fi
+    # Installation exits on failure; a subshell keeps the menu available afterwards.
+    local result
+    set +e
+    ( set -e; main "${args[@]}" )
+    result=$?
+    set -e
+    if ((result != 0)); then printf '安装未完成，请检查上方提示。\n' >&2; fi
+}
+
+menu_main() {
+    [[ $EUID == 0 ]] || die 'Run as root.'
+    menu_open
+    local choice first
+    while true; do
+        menu_header
+        menu_read choice 'Select: ' || return 0
+        case "$choice" in
+            1|2)
+                if [[ -f $BASE/state.json ]]; then
+                    if [[ $choice == 1 ]]; then menu_manage node; else menu_manage relay; fi
+                elif declare -F install_wizard >/dev/null; then
+                    if [[ $choice == 1 ]]; then install_wizard server; else install_wizard relay; fi
+                    menu_pause
+                else printf '安装状态缺失，请重新运行安装脚本检查。\n'; menu_pause; fi ;;
+            9)
+                if [[ -f $BASE/state.json ]]; then
+                    menu_run node list
+                    menu_run relay list
+                    first=$(jq -r '.nodes[0].name // .relays[0].name // ""' "$BASE/state.json")
+                    [[ -z $first ]] || menu_run info "$first"
+                    menu_run status
+                else printf '尚未安装 dex-lite。\n'; fi
+                menu_pause ;;
+            0) return ;;
+            *) printf '请输入 1、2、9 或 0。\n'; menu_pause ;;
+        esac
+    done
+}
+
 manager_main() {
     [[ $EUID == 0 ]] || die 'Run as root.'
+    if (($# == 0)) || [[ ${1:-} == menu ]]; then menu_main; return; fi
     if [[ ${1:-help} == help || ${1:-} == --help ]]; then
         cat <<'HELP'
 Dex Lite — one Xray process for VLESS WS TLS nodes and port relays
+  dex-lite                                  Interactive menu (1/2/9/0)
   dex-lite info [NAME]                       Node + QR or relay details (default main)
   dex-lite node list
   dex-lite node add NAME PORT [UUID]         Reuse installed hostname/certificate
@@ -247,7 +407,7 @@ BASE=/etc/vless-lite
 XRAY_BIN=/usr/local/bin/vless-lite-xray
 CONFIG_GROUP=vless-lite
 MANAGER
-        declare -f die show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info relay_info manager_main
+        declare -f die show_info parse_port valid_name valid_uuid valid_host validate_state render_state port_available managed_config_matches apply_state node_info relay_info menu_open menu_read menu_pause menu_header menu_run menu_manage menu_main manager_main
         # shellcheck disable=SC2016
         printf '\nmanager_main "$@"\n'
     } > "$temporary"
@@ -300,6 +460,7 @@ scrub_dns() {
 }
 
 main() {
+    if (($# == 0)) || [[ ${1:-} == menu ]]; then menu_main; return; fi
     case ${1:-} in
         info|node|relay|status) manager_main "$@"; return ;;
         --upgrade) (($# == 1)) || die '--upgrade does not accept installation options.'; upgrade_manager; return ;;
@@ -323,6 +484,7 @@ main() {
             -h|--help)
                 cat <<'HELP'
 Usage: bash install.sh [options]
+  (no options)        Open the interactive 1/2/9/0 menu
   --mode server|relay Create a dex-compatible node or a plain relay (default server)
   --domain HOST       TLS hostname; prompted when omitted
   --port PORT         Container listening port, 1024-65535 (default 2096)
