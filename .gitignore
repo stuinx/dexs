@@ -1,0 +1,5 @@
+.env
+*.pem
+*.key
+node.json
+*.log
