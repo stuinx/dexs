@@ -31,6 +31,13 @@ cat > "$BASE/state.json" <<'JSON'
 {"version":1,"domain":"node.example.com","nodes":[{"name":"main","port":29344,"uuid":"00000000-0000-4000-8000-000000123456"}],"relays":[]}
 JSON
 validate_state "$BASE/state.json"
+[[ $(parse_port 443) == 443 && $(parse_port 1) == 1 && $(parse_port 65535) == 65535 ]]
+for invalid_port in 0 65536 invalid; do
+    if (parse_port "$invalid_port") >/dev/null 2>&1; then exit 1; fi
+done
+jq '.nodes[0].port=443 | .relays=[{name:"dns",port:53,host:"1.1.1.1",target_port:53,network:"tcp,udp"}]' "$BASE/state.json" > "$taskdir/lowports.json"
+validate_state "$taskdir/lowports.json"
+echo 'Low-port node/relay metadata and port boundaries: passed'
 render_state "$BASE/state.json" > "$BASE/config.json"
 jq -e '.inbounds[0].streamSettings.wsSettings.path == "/123456" and .inbounds[0].streamSettings.security == "tls"' "$BASE/config.json" >/dev/null
 "$XRAY_BIN" run -test -config "$BASE/config.json" > "$taskdir/check.log" 2>&1
@@ -186,14 +193,21 @@ printf '33346\nnode.example.com\n443\ntcp\n' > "$taskdir/wizard-input"
 ) > "$taskdir/wizard-output" 2>&1
 printf '%s\n' --mode relay --port 33346 --target-host node.example.com --target-port 443 --network tcp > "$taskdir/expected-args"
 cmp -s "$taskdir/wizard-args" "$taskdir/expected-args"
-printf 'node.example.com\n33344\n\n1\nn\n' > "$taskdir/wizard-input"
+printf 'node.example.com\n443\n\n1\nn\n' > "$taskdir/wizard-input"
 (
     # shellcheck disable=SC2317
     main() { printf '%s\n' "$@" > "$taskdir/wizard-args"; }
     exec 7< "$taskdir/wizard-input"; install_wizard server
 ) > "$taskdir/wizard-output" 2>&1
-printf '%s\n' --mode server --domain node.example.com --port 33344 > "$taskdir/expected-args"
+printf '%s\n' --mode server --domain node.example.com --port 443 > "$taskdir/expected-args"
 cmp -s "$taskdir/wizard-args" "$taskdir/expected-args"
+printf 'node.example.com:443\n' > "$taskdir/wizard-input"
+(exec 7< "$taskdir/wizard-input"; install_wizard server) > "$taskdir/wizard-invalid" 2>&1
+grep -q '域名无效' "$taskdir/wizard-invalid"
+printf 'node.example.com\n0\n' > "$taskdir/wizard-input"
+(exec 7< "$taskdir/wizard-input"; install_wizard server) > "$taskdir/wizard-invalid" 2>&1
+grep -q 'Port must be 1-65535' "$taskdir/wizard-invalid"
+if grep -q 'UUID\|证书方式' "$taskdir/wizard-invalid"; then exit 1; fi
 echo '1/2/9/0 menus, add/delete/cancel, error recovery and installation prompts: passed'
 
 BASE="$taskdir/legacy"

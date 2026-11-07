@@ -61,7 +61,7 @@ show_info() {
 
 parse_port() {
     [[ $1 =~ ^[0-9]{1,5}$ ]] || die 'Invalid port.'
-    local value=$((10#$1)) minimum=${2:-1024}
+    local value=$((10#$1)) minimum=${2:-1}
     ((value >= minimum && value <= 65535)) || die "Port must be $minimum-65535."
     printf '%s\n' "$value"
 }
@@ -90,10 +90,10 @@ validate_state() {
       (.nodes | type == "array") and (.relays | type == "array") and
       all(.nodes[]; (.name | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")) and
         (.uuid | test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) and
-        (.port | type == "number" and floor == . and . >= 1024 and . <= 65535)) and
+        (.port | type == "number" and floor == . and . >= 1 and . <= 65535)) and
       all(.relays[]; (.name | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")) and
         (.host | type == "string") and
-        (.port | type == "number" and floor == . and . >= 1024 and . <= 65535) and
+        (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
         (.target_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
         (.network == "tcp" or .network == "udp" or .network == "tcp,udp")) and
       ([.nodes[].port,.relays[].port] | length == (unique | length)) and
@@ -269,8 +269,14 @@ install_wizard() {
     local -a args=(--mode "$mode")
     if [[ $mode == server ]]; then
         printf '\n============ 安装 Server 节点 ============\n'
-        menu_read domain '节点域名: ' || return 0
+        menu_read domain '节点域名（不含端口）: ' || return 0
+        domain=${domain,,}
+        if [[ $domain != *.* || $domain == *:* ]] || ! valid_host "$domain"; then
+            printf '域名无效，请只填写域名，端口在下一项填写。\n' >&2
+            return 0
+        fi
         menu_read port '监听端口（默认 2096）: ' || return 0
+        port=$(parse_port "${port:-2096}") || return 0
         menu_read uuid 'UUID（回车自动生成）: ' || return 0
         args+=(--domain "$domain" --port "${port:-2096}")
         [[ -z $uuid ]] || args+=(--uuid "$uuid")
@@ -289,6 +295,7 @@ install_wizard() {
     else
         printf '\n============ 安装纯中转 ============\n'
         menu_read port '监听端口（默认 2096）: ' || return 0
+        port=$(parse_port "${port:-2096}") || return 0
         menu_read host '目标 IP / 域名: ' || return 0
         menu_read target '目标端口: ' || return 0
         menu_read network '协议 tcp / udp / tcp,udp（默认 tcp）: ' || return 0
@@ -540,7 +547,7 @@ Usage: bash install.sh [options]
   (no options)        Open the interactive 1/2/9/0 menu
   --mode server|relay Create a dex-compatible node or a plain relay (default server)
   --domain HOST       TLS hostname; prompted when omitted
-  --port PORT         Container listening port, 1024-65535 (default 2096)
+  --port PORT         Container listening port, 1-65535 (default 2096)
   --uuid UUID         Existing UUID; generated when omitted
   --cert-file FILE    Existing full-chain PEM certificate
   --key-file FILE     Matching unencrypted PEM private key
@@ -692,6 +699,8 @@ ExecStart=/usr/local/bin/vless-lite-xray run -config /etc/vless-lite/config.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 UMask=0077
 [Install]
 WantedBy=multi-user.target
@@ -703,6 +712,7 @@ description="dexs nodes and port relays"
 command="/usr/local/bin/vless-lite-xray"
 command_args="run -config /etc/vless-lite/config.json"
 command_user="vless-lite:vless-lite"
+capabilities="^cap_net_bind_service"
 supervisor="supervise-daemon"
 pidfile="/run/vless-lite/supervisor.pid"
 output_log="/var/log/vless-lite.log"

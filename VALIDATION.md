@@ -80,6 +80,15 @@ Cloudflare DNS-01 单次签发和清理 DNS 验证记录在现有 LXC 成功执�
 - 新增 `tests/alpine-runtime.sh` 用于上述一次性容器的真实 OpenRC 回归，带测试容器标记检查，避免直接用于生产节点。
 - 修改后再次执行 vm1225 的 ShellCheck 和完整 `tests/smoke.sh`，包括菜单、节点、中转、UDP、回滚和旧版迁移，全部通过。
 
+## 低端口修复（443）
+
+- 修正安装、管理命令及元数据校验，监听端口支持 1–65535；域名和端口在向导中即时校验。
+- 新装 systemd 服务保留专用用户和 `NoNewPrivileges`，仅授予 `CAP_NET_BIND_SERVICE`；OpenRC 通过 ambient capability 为专用用户提供低端口绑定能力。
+- vm1225 的 ShellCheck、完整 smoke 回归通过，新增 443、1、65535 边界和非法输入检查，验证域名带端口时立即提示。
+- vm1225 的真实临时 systemd 服务以专用非 root 用户监听 TCP/UDP 844，`CapEff` / `CapAmb` 均为 `0x400`，`NoNewPrivs=1`，经 HTTPS 中转返回 200。测试机 443 已占用，因此未改动现有服务，改用空闲的低端口 844。临时服务及用户已清理。
+- Alpine 3.22 / OpenRC 0.62.6 的一次性 128 MiB Docker 容器内，使用新服务模板和现有 Xray 26.3.27，显式设置 `net.ipv4.ip_unprivileged_port_start=1024`。核心以 UID 100 监听 TCP/UDP 443，`CapEff` / `CapAmb` 均为 `0x400`，HTTPS 中转返回 200。另以自签测试 CA 配置 VLESS + WS + TLS 节点 443，客户端校验证书并经 SOCKS 访问 HTTPS 返回 200；容器 `oom=0` / `oom_kill=0`。本次未重新执行完整 Alpine 安装或完整 `tests/alpine-runtime.sh`，仅验证变更后的服务模板、低端口中转和 TLS 节点流量。
+- 本修复更新新安装服务；`--upgrade` 仍只更新管理命令，不调整旧服务权限。
+
 ## 尚未验证
 
 - 在全新 128 MiB LXC 中从零运行整个安装器，包括 APT、用户创建、systemd 和生产证书签发。

@@ -58,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/dexs/main/install.sh)
 
 这表示容器的 TCP 33346 转发到已有节点 `node.example.com:33344`；可加 `--network tcp,udp`。纯中转模式跳过二维码工具和证书申请流程，完成后输出真实中转参数。运行 `dexs info` 查看默认中转；用 `relay add/list/info/del` 管理其他规则。尚未配置本地 TLS 节点的纯中转安装不能用 `node add` 创建节点。
 
-支持 1024–65535，避免在受限 LXC 中为低端口增加权限。容器需要运行中的 systemd 或 OpenRC、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
+支持 1–65535，包括 443。新安装服务仍以专用用户运行，通过 `CAP_NET_BIND_SERVICE` 绑定低端口；LXC 宿主机需要保留此能力。容器需要运行中的 systemd 或 OpenRC、可用的出站网络和可用的 TCP 入站映射。128 MiB 是运行目标，实际内存随并发和核心版本变化；建议宿主机为容器提供 swap，以应对安装和证书签发时的峰值。
 
 ## TLS 证书
 
@@ -135,7 +135,7 @@ dexs relay del transit
 dexs relay add game 33347 target.example.com 12345 tcp,udp
 ```
 
-语法：`relay add NAME LISTEN_PORT TARGET_HOST TARGET_PORT [tcp|udp|tcp,udp]`，默认 TCP。目标填写域名或 IP，不带 URL scheme、端口或 IPv6 方括号；目标端口支持 1–65535，监听端口支持 1024–65535。新增规则是未认证的固定目标端口转发，按需限制入口来源，尤其不要无意对公网提供开放 DNS 转发。
+语法：`relay add NAME LISTEN_PORT TARGET_HOST TARGET_PORT [tcp|udp|tcp,udp]`，默认 TCP。目标填写域名或 IP，不带 URL scheme、端口或 IPv6 方括号；目标端口支持 1–65535，监听端口支持 1–65535。新增规则是未认证的固定目标端口转发，按需限制入口来源，尤其不要无意对公网提供开放 DNS 转发。
 
 转发 VLESS WS TLS 时，中转端透传 TLS，不申请证书。客户端的 **Address 改成中转机地址与入口端口；TLS/SNI、WS Host、UUID、Path 仍使用最终服务端的值**。这同样能携带封装在 VLESS WS/TCP 内的 UDP 代理数据；独立 UDP 模式则是转发原生 UDP 数据报。
 
@@ -153,7 +153,7 @@ dexs relay add game 33347 target.example.com 12345 tcp,udp
 bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/stuinx/dexs/main/install.sh) --upgrade'
 ```
 
-升级管理命令为 `dexs`，旧命令 `dex-lite` / `vless-lite` 转为兼容入口，并将旧 `node.json` 迁移为管理元数据；保留已有 UUID、端口、路径、证书、核心和运行配置，不重启服务。遇到自定义配置或无关同名命令会拒绝自动迁移。该命令适用于本项目已有安装，不会接管 dex 或其他脚本创建的服务。
+升级管理命令为 `dexs`，旧命令 `dex-lite` / `vless-lite` 转为兼容入口，并将旧 `node.json` 迁移为管理元数据；保留已有 UUID、端口、路径、证书、核心和运行配置，不重启服务。遇到自定义配置或无关同名命令会拒绝自动迁移。该命令适用于本项目已有安装，不会接管 dex 或其他脚本创建的服务。 `--upgrade` 不修改服务权限；旧版已安装服务若需新增低端口，需另行更新服务的绑定权限。
 
 项目与仓库现名为 **dexs**。为兼容已部署节点及证书续期任务，配置目录 `/etc/vless-lite`、服务名/用户 `vless-lite` 和核心文件名 `vless-lite-xray` 延续原名；日常操作统一使用 `dexs`。
 

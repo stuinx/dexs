@@ -13,6 +13,12 @@ cleanup() {
 trap cleanup EXIT
 rc-service -q vless-lite status
 [[ -L /etc/runlevels/default/vless-lite ]]
+dexs relay add low443 443 example.com 443 tcp,udp
+[[ -n $(ss -H -ltn 'sport = :443') && -n $(ss -H -lun 'sport = :443') ]]
+low_status=$(curl -sS --connect-to example.com:443:127.0.0.1:443 --noproxy '*' --connect-timeout 8 --max-time 25 -o /dev/null -w '%{http_code}' https://example.com/)
+[[ $low_status == 200 ]]
+dexs relay del low443
+echo 'OpenRC non-root TCP/UDP port 443 and HTTPS relay: passed'
 dexs node add extra 29348 00000000-0000-4000-8000-000000654321 > "$taskdir/extra.txt"
 dexs relay add web 29346 example.com 443 tcp
 dexs relay add node 29347 127.0.0.1 29344 tcp
@@ -55,6 +61,8 @@ for status in /proc/[0-9]*/status; do
     if [[ $args == '/usr/local/bin/vless-lite-xray run -config /etc/vless-lite/config.json '* ]]; then
         [[ $(awk '/^Uid:/{print $2}' "$status") == "$(id -u vless-lite)" ]]
         [[ $(awk '/^Umask:/{print $2}' "$status") == 0077 ]]
+        [[ $(awk '/^CapEff:/{print $2}' "$status") == 0000000000000400 ]]
+        [[ $(awk '/^CapAmb:/{print $2}' "$status") == 0000000000000400 ]]
         awk '/^VmRSS:/{print "OpenRC core " $0}' "$status"
         found=1
         break
